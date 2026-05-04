@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import networkx as nx
+import igraph as ig
 import numpy as np
 from PIL import Image
 
@@ -28,10 +29,8 @@ def step_road(road, vmax=5, p=0.3, circular=True):
         if v == NSEMPTY:
             continue
 
-        # 1. Acceleration
         v = min(v + 1, vmax)
 
-        # 2. Slowing down due to gap
         gap = 0
         for d in range(1, vmax + 1):
             j = i + d
@@ -47,13 +46,11 @@ def step_road(road, vmax=5, p=0.3, circular=True):
 
         v = min(v, gap)
 
-        # 3. Random braking
         if random.random() < p:
             v = max(v - 1, 0)
 
         speeds[i] = v
 
-    # 4. Movement
     new = [NSEMPTY] * n
 
     for i, v in enumerate(speeds):
@@ -72,7 +69,7 @@ def step_road(road, vmax=5, p=0.3, circular=True):
 
 
 # ============================================================
-# Car representation for graph mode
+# Data structures
 # ============================================================
 
 @dataclass
@@ -86,28 +83,32 @@ class Car:
 
 
 @dataclass
-class JunctionRequest:
+class MovePlan:
     car_id: int
     from_edge: int
-    to_edge: int | None
-    arrival_node: str
-    target_cell: int
-    old_cell: int
+    from_cell: int
+    to_edge: int
+    to_cell: int
+    crosses_junction: bool
+    junction: str | None = None
+    turn_type: str | None = None
+    priority: int = 0
 
 
 # ============================================================
-# Graph-road NaSch model
+# Graph-road traffic simulator
 # ============================================================
 
 class GraphRoadNetwork:
     """
-    Graph-based NaSch traffic model.
+    Graph-based NaSch/cellular traffic model.
 
-    Important representation change:
+    Representation:
         roads[edge_idx][cell_idx] = -1      empty cell
         roads[edge_idx][cell_idx] = car_id  occupied cell
 
-    Speeds and destinations live in self.cars[car_id].
+    Each graph edge is represented as a one-way cell road.
+    If the input graph is undirected, each undirected street becomes two one-way roads.
     """
 
     def __init__(
@@ -117,18 +118,27 @@ class GraphRoadNetwork:
         edge_lengths,
         G=None,
         route_graph=None,
+        ig_graph=None,
+        node_to_ig=None,
+        ig_to_node=None,
         pos=None,
         edge_length_m=None,
         in_nodes=None,
         out_nodes=None,
+        k_paths=3,
     ):
         self.nodes = list(nodes)
         self.edges = list(edges)
         self.edge_lengths = list(edge_lengths)
         self.G = G
         self.route_graph = route_graph
+        self.ig_graph = ig_graph
+        self.node_to_ig = node_to_ig or {}
+        self.ig_to_node = ig_to_node or {}
+        self.path_cache = {}
         self.pos = pos or {}
         self.edge_length_m = edge_length_m or [float(L) for L in edge_lengths]
+        self.k_paths = k_paths
 
         self.node_to_idx = {n: i for i, n in enumerate(self.nodes)}
         self.edge_to_idx = {e: i for i, e in enumerate(self.edges)}
@@ -146,11 +156,18 @@ class GraphRoadNetwork:
         self.roads = [[NSEMPTY] * L for L in self.edge_lengths]
         self.cars = {}
         self.next_car_id = 0
+
         self.finished_cars = 0
         self.failed_spawns = 0
         self.spawned_cars = 0
+        self.blocked_junction_moves = 0
+        self.accepted_junction_moves = 0
+        self.internal_moves = 0
+
         self.od_pairs = []
         self.od_by_origin = {}
+        self.snapshots = []
+
         self.build_od_cache()
 
     @classmethod
@@ -159,18 +176,10 @@ class GraphRoadNetwork:
         G,
         inout=None,
         cell_length_m=7.0,
-        min_cells=None,
+        min_cells=3,
         bidirectional_if_undirected=True,
+        k_paths=3,
     ):
-        """
-        Build the internal edge-list representation from a NetworkX graph.
-
-        If G is undirected, roads are made bidirectional by default:
-            u -> v and v -> u both become separate road segments.
-
-        This is important because cars follow directed edge pairs internally.
-        Without reverse edges, many shortest paths can become unusable.
-        """
         if min_cells is None:
             min_cells = 1
 
@@ -212,6 +221,12 @@ class GraphRoadNetwork:
         for (u, v), length_m in zip(edges, lengths_m):
             route_graph.add_edge(u, v, length=length_m)
 
+        node_to_ig = {node: i for i, node in enumerate(nodes)}
+        ig_to_node = {i: node for node, i in node_to_ig.items()}
+        ig_edges = [(node_to_ig[u], node_to_ig[v]) for u, v in edges]
+        ig_graph = ig.Graph(n=len(nodes), edges=ig_edges, directed=True)
+        ig_graph.es["length"] = lengths_m
+
         in_nodes = inout.get("in", []) if inout else []
         out_nodes = inout.get("out", []) if inout else []
 
@@ -221,22 +236,21 @@ class GraphRoadNetwork:
             edge_lengths=lengths_cells,
             G=G,
             route_graph=route_graph,
+            ig_graph=ig_graph,
+            node_to_ig=node_to_ig,
+            ig_to_node=ig_to_node,
             pos=pos,
             edge_length_m=lengths_m,
             in_nodes=in_nodes,
             out_nodes=out_nodes,
+            k_paths=k_paths,
         )
 
     # --------------------------------------------------------
-    # Spawning and routing
+    # Routing and spawning
     # --------------------------------------------------------
 
     def build_od_cache(self):
-        """
-        Precompute reachable origin-destination pairs.
-
-        This avoids repeatedly trying impossible OD pairs during injection.
-        """
         self.od_pairs = []
         self.od_by_origin = {origin: [] for origin in self.in_nodes}
 
@@ -253,10 +267,88 @@ class GraphRoadNetwork:
                 self.od_pairs.append((origin, destination))
                 self.od_by_origin.setdefault(origin, []).append(destination)
 
-    def random_reachable_od(self):
-        if not self.od_pairs:
-            return None, None
-        return random.choice(self.od_pairs)
+    def shortest_path(self, origin, destination):
+        """
+        Fast shortest path using igraph.
+        Returns node names, not igraph vertex IDs.
+        """
+        if self.ig_graph is None:
+            return None
+
+        if origin not in self.node_to_ig or destination not in self.node_to_ig:
+            return None
+
+        key = (origin, destination, "shortest")
+        if key in self.path_cache:
+            return self.path_cache[key]
+
+        source = self.node_to_ig[origin]
+        target = self.node_to_ig[destination]
+
+        path_ids = self.ig_graph.get_shortest_paths(
+            source,
+            to=target,
+            weights="length",
+            output="vpath",
+        )[0]
+
+        if not path_ids or len(path_ids) < 2:
+            self.path_cache[key] = None
+            return None
+
+        path = [self.ig_to_node[i] for i in path_ids]
+        self.path_cache[key] = path
+        return path
+
+    def random_path(self, origin, destination):
+        """
+        Fast route choice using igraph.
+
+        For speed, this defaults to shortest path. If k_paths > 1, it creates
+        variation by adding small random penalties to edge weights and caching
+        a few alternatives per OD pair. This is much faster than
+        networkx.shortest_simple_paths for repeated simulation use.
+        """
+        if self.ig_graph is None or origin == destination:
+            return None
+
+        key = (origin, destination, self.k_paths)
+        if key in self.path_cache:
+            paths = self.path_cache[key]
+            return random.choice(paths) if paths else None
+
+        if origin not in self.node_to_ig or destination not in self.node_to_ig:
+            self.path_cache[key] = []
+            return None
+
+        source = self.node_to_ig[origin]
+        target = self.node_to_ig[destination]
+        paths = []
+
+        base_lengths = np.array(self.ig_graph.es["length"], dtype=float)
+        tries = max(1, self.k_paths)
+
+        for attempt in range(tries):
+            if attempt == 0 or self.k_paths <= 1:
+                weights = base_lengths
+            else:
+                noise = np.random.uniform(0.95, 1.25, size=len(base_lengths))
+                weights = base_lengths * noise
+
+            path_ids = self.ig_graph.get_shortest_paths(
+                source,
+                to=target,
+                weights=weights.tolist(),
+                output="vpath",
+            )[0]
+
+            if path_ids and len(path_ids) >= 2:
+                path = [self.ig_to_node[i] for i in path_ids]
+                if path not in paths:
+                    paths.append(path)
+
+        self.path_cache[key] = paths
+        return random.choice(paths) if paths else None
 
     def random_node_with_outgoing_edge(self):
         candidates = [n for n in self.nodes if self.out_edges.get(n)]
@@ -264,7 +356,7 @@ class GraphRoadNetwork:
             return None
         return random.choice(candidates)
 
-    def random_reachable_destination_from(self, origin, allowed_destinations=None, max_tries=30):
+    def random_reachable_destination_from(self, origin, allowed_destinations=None, max_tries=50):
         if allowed_destinations is None:
             allowed_destinations = self.nodes
 
@@ -276,7 +368,7 @@ class GraphRoadNetwork:
             destination = random.choice(allowed_destinations)
             if destination == origin:
                 continue
-            path = self.shortest_path(origin, destination)
+            path = self.random_path(origin, destination)
             if path is not None and len(path) >= 2:
                 return destination
 
@@ -288,15 +380,6 @@ class GraphRoadNetwork:
         boundary_sources="inout",
         boundary_destinations="inout",
     ):
-        """
-        Choose an OD pair.
-
-        With probability boundary_probability:
-            use boundary nodes, e.g. in/out nodes.
-
-        Otherwise:
-            use a random internal graph trip.
-        """
         boundary_sources_set = set()
         if boundary_sources in ("in", "inout"):
             boundary_sources_set |= self.in_nodes
@@ -330,26 +413,12 @@ class GraphRoadNetwork:
         destination = self.random_reachable_destination_from(origin)
         return origin, destination
 
-    def shortest_path(self, origin, destination):
-        """
-        Route only over edges that actually exist in the simulation.
-        """
-        if self.route_graph is None:
-            return None
-        try:
-            return nx.shortest_path(self.route_graph, origin, destination, weight="length")
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            return None
-
     def spawn_car(self, origin, destination, speed=0):
-        """
-        Spawn a car at origin with a fixed destination.
-        The car follows a shortest path and despawns at destination.
-        """
         if origin == destination:
+            self.failed_spawns += 1
             return False
 
-        path = self.shortest_path(origin, destination)
+        path = self.random_path(origin, destination)
         if path is None or len(path) < 2:
             self.failed_spawns += 1
             return False
@@ -388,23 +457,11 @@ class GraphRoadNetwork:
         boundary_sources="inout",
         boundary_destinations="inout",
     ):
-        """
-        Inject new cars with mixed demand.
-
-        Default behavior:
-            70% boundary-to-boundary trips
-            30% random internal graph trips
-
-        boundary_sources / boundary_destinations can be:
-            "in"    -> only in_nodes
-            "out"   -> only out_nodes
-            "inout" -> in_nodes union out_nodes
-        """
         if max_new_cars is None:
             boundary_count = max(1, len(self.in_nodes | self.out_nodes))
             max_new_cars = max(1, int(round(rate * boundary_count)))
 
-        attempts = max_new_cars * 3
+        attempts = max_new_cars * 4
         inserted = 0
 
         for _ in range(attempts):
@@ -426,28 +483,37 @@ class GraphRoadNetwork:
 
         return inserted, attempts
 
-    def populate_random_od(self, density=0.05, vmax=5):
+    def populate_random_od(self, density=0.05, vmax=5, destinations_mode="out"):
         """
-        Random initial distribution with valid origin/destination cars.
+        Initial cars throughout the graph.
 
-        This places cars throughout the graph, but only on edges that can still
-        reach at least one output node from their downstream endpoint.
+        destinations_mode:
+            "out"   -> destinations from out_nodes
+            "inout" -> destinations from in_nodes union out_nodes
+            "all"   -> destinations can be anywhere
         """
-        if not self.out_nodes:
-            raise ValueError("populate_random_od needs out_nodes in inout.json")
+        if destinations_mode == "out":
+            destinations = list(self.out_nodes)
+        elif destinations_mode == "inout":
+            destinations = list(self.in_nodes | self.out_nodes)
+        else:
+            destinations = list(self.nodes)
 
-        destinations = list(self.out_nodes)
+        if not destinations:
+            destinations = list(self.nodes)
 
         for ei, road in enumerate(self.roads):
             u, v = self.edges[ei]
 
-            reachable_destinations = []
+            reachable = []
             for destination in destinations:
-                path_tail = self.shortest_path(v, destination)
+                if destination == v:
+                    continue
+                path_tail = self.random_path(v, destination)
                 if path_tail is not None and len(path_tail) >= 1:
-                    reachable_destinations.append((destination, path_tail))
+                    reachable.append((destination, path_tail))
 
-            if not reachable_destinations:
+            if not reachable:
                 continue
 
             for cell_idx in range(len(road)):
@@ -457,7 +523,7 @@ class GraphRoadNetwork:
                 if random.random() >= density:
                     continue
 
-                selected_destination, path_tail = random.choice(reachable_destinations)
+                destination, path_tail = random.choice(reachable)
                 selected_path = [u] + path_tail
 
                 if len(selected_path) < 2:
@@ -470,7 +536,7 @@ class GraphRoadNetwork:
                     car_id=car_id,
                     speed=random.randint(0, vmax),
                     origin=u,
-                    destination=selected_destination,
+                    destination=destination,
                     path=selected_path,
                     path_pos=0,
                 )
@@ -478,11 +544,15 @@ class GraphRoadNetwork:
                 road[cell_idx] = car_id
                 self.spawned_cars += 1
 
+    # --------------------------------------------------------
+    # Edge and route helpers
+    # --------------------------------------------------------
+
     def reverse_edge_idx(self, edge_idx):
         u, v = self.edges[edge_idx]
         return self.edge_to_idx.get((v, u))
-    
-    def get_next_edge_for_car(self, car_id, current_edge):
+
+    def get_next_edge_for_car(self, car_id, current_edge, allow_u_turn=False):
         car = self.cars[car_id]
 
         if car.path_pos + 2 >= len(car.path):
@@ -492,20 +562,26 @@ class GraphRoadNetwork:
         v = car.path[car.path_pos + 2]
         next_edge = self.edge_to_idx.get((u, v))
 
-        if next_edge == self.reverse_edge_idx(current_edge):
+        if next_edge is None:
             return None
 
+        if not allow_u_turn and next_edge == self.reverse_edge_idx(current_edge):
+            return None
+
+        return next_edge
+
+    def find_car_position(self, car_id):
+        for ei, road in enumerate(self.roads):
+            for ci, cell in enumerate(road):
+                if cell == car_id:
+                    return ei, ci
+        return None, None
+
     # --------------------------------------------------------
-    # NaSch update on graph
+    # NaSch speed update and movement planning
     # --------------------------------------------------------
 
     def edge_gap(self, edge_idx, cell_idx, vmax):
-        """
-        Gap ahead on the current edge only.
-
-        Near a junction, this allows cars to request movement through the
-        junction. Blocking is then handled by the junction resolver.
-        """
         road = self.roads[edge_idx]
         L = len(road)
         gap = 0
@@ -525,9 +601,6 @@ class GraphRoadNetwork:
         return gap
 
     def update_speeds(self, vmax=5, p=0.3):
-        """
-        Apply NaSch acceleration, slowing, and randomization.
-        """
         for ei, road in enumerate(self.roads):
             for i, car_id in enumerate(road):
                 if car_id == NSEMPTY:
@@ -544,179 +617,292 @@ class GraphRoadNetwork:
 
                 car.speed = speed
 
-    def collect_movements(self):
+    def plan_movements(self, allow_u_turn=False):
         """
-        Build normal movements and junction requests from current speeds.
-        """
-        new_roads = [[NSEMPTY] * len(road) for road in self.roads]
-        requests = []
+        Plan all movements before applying any of them.
 
-        # Process cars from front to back on each edge.
+        Internal moves stay on the same edge.
+        Junction moves are resolved later per node.
+        """
+        internal_plans = []
+        junction_plans = []
+
         for ei, road in enumerate(self.roads):
             u, arrival_node = self.edges[ei]
             L = len(road)
 
             for i in range(L - 1, -1, -1):
                 car_id = road[i]
-                if car_id == NSEMPTY:
+                if car_id == NSEMPTY or car_id not in self.cars:
                     continue
 
                 car = self.cars[car_id]
                 target = i + car.speed
 
                 if target < L:
-                    if new_roads[ei][target] == NSEMPTY:
-                        new_roads[ei][target] = car_id
-                    else:
-                        # Safety fallback: if target is occupied in the new road,
-                        # place it as far forward as possible behind that cell.
-                        placed = False
-                        for k in range(target - 1, i - 1, -1):
-                            if new_roads[ei][k] == NSEMPTY:
-                                new_roads[ei][k] = car_id
-                                car.speed = max(0, k - i)
-                                placed = True
-                                break
-                        if not placed:
-                            new_roads[ei][i] = car_id
-                            car.speed = 0
+                    internal_plans.append(
+                        MovePlan(
+                            car_id=car_id,
+                            from_edge=ei,
+                            from_cell=i,
+                            to_edge=ei,
+                            to_cell=target,
+                            crosses_junction=False,
+                        )
+                    )
+                    continue
+
+                # Destination reached at this node.
+                if arrival_node == car.destination:
+                    junction_plans.append(
+                        MovePlan(
+                            car_id=car_id,
+                            from_edge=ei,
+                            from_cell=i,
+                            to_edge=-1,
+                            to_cell=-1,
+                            crosses_junction=True,
+                            junction=arrival_node,
+                            turn_type="exit",
+                            priority=100,
+                        )
+                    )
+                    continue
+
+                next_edge = self.get_next_edge_for_car(car_id, ei, allow_u_turn=allow_u_turn)
+                if next_edge is None:
+                    # No valid route continuation. It will be blocked at the edge end.
+                    junction_plans.append(
+                        MovePlan(
+                            car_id=car_id,
+                            from_edge=ei,
+                            from_cell=i,
+                            to_edge=ei,
+                            to_cell=L - 1,
+                            crosses_junction=True,
+                            junction=arrival_node,
+                            turn_type="blocked",
+                            priority=-1,
+                        )
+                    )
                     continue
 
                 overflow = target - L
+                to_cell = min(overflow, len(self.roads[next_edge]) - 1)
+                turn_type = self.turn_type(ei, next_edge)
 
-                # Destination reached: despawn.
-                if arrival_node == car.destination:
-                    self.finished_cars += 1
-                    del self.cars[car_id]
-                    continue
-
-                to_edge = self.get_next_edge_for_car(car_id, ei)
-
-                requests.append(
-                    JunctionRequest(
+                junction_plans.append(
+                    MovePlan(
                         car_id=car_id,
                         from_edge=ei,
-                        to_edge=to_edge,
-                        arrival_node=arrival_node,
-                        target_cell=overflow,
-                        old_cell=i,
+                        from_cell=i,
+                        to_edge=next_edge,
+                        to_cell=to_cell,
+                        crosses_junction=True,
+                        junction=arrival_node,
+                        turn_type=turn_type,
+                        priority=self.turn_priority(turn_type),
                     )
                 )
 
-        return new_roads, requests
+        return internal_plans, junction_plans
 
-    def resolve_junction_requests(self, requests):
+    # --------------------------------------------------------
+    # Junction resolution
+    # --------------------------------------------------------
+
+    def resolve_junctions(self, junction_plans):
         """
-        Resolve competing junction movements.
+        Allow multiple compatible junction movements.
 
-        A simplified right-hand rule is used when several cars request the same
-        junction at the same timestep. One winner per junction is allowed.
+        Per junction:
+            1. exits are accepted immediately
+            2. invalid/no-route cars are rejected
+            3. valid requests are sorted by priority
+            4. accept a request if it does not conflict with already accepted ones
+            5. otherwise reject only that request
         """
         by_node = {}
-        for r in requests:
-            by_node.setdefault(r.arrival_node, []).append(r)
+        for plan in junction_plans:
+            by_node.setdefault(plan.junction, []).append(plan)
 
         accepted = []
         rejected = []
 
-        for node, node_requests in by_node.items():
-            valid = [r for r in node_requests if r.to_edge is not None]
-            invalid = [r for r in node_requests if r.to_edge is None]
+        for node, plans in by_node.items():
+            exits = [p for p in plans if p.turn_type == "exit"]
+            blocked = [p for p in plans if p.turn_type == "blocked" or p.to_edge is None]
+            valid = [p for p in plans if p.turn_type not in ("exit", "blocked") and p.to_edge >= 0]
 
-            rejected.extend(invalid)
+            accepted.extend(exits)
+            rejected.extend(blocked)
 
-            if not valid:
-                continue
+            # Shuffle before sorting to avoid deterministic bias among exact ties.
+            random.shuffle(valid)
+            valid.sort(key=lambda p: (-p.priority, self.right_hand_score(p, valid)))
 
-            if len(valid) == 1:
-                accepted.append(valid[0])
-            else:
-                winner = self.right_hand_rule(node, valid)
-                accepted.append(winner)
-                rejected.extend([r for r in valid if r is not winner])
+            local_accepted = []
+            for plan in valid:
+                if all(not self.movements_conflict(plan, other) for other in local_accepted):
+                    local_accepted.append(plan)
+                else:
+                    rejected.append(plan)
+
+            accepted.extend(local_accepted)
 
         return accepted, rejected
 
-    def right_hand_rule(self, node, requests):
+    def movements_conflict(self, a, b):
         """
-        Simplified yield-to-the-right rule.
+        Approximate junction conflict model.
 
-        For each request, count how many other incoming cars are on its right.
-        The car with the fewest blockers wins. Ties are random.
+        This is intentionally simple but much less restrictive than one-car-per-junction.
         """
-        if len(requests) == 1:
-            return requests[0]
+        if a.car_id == b.car_id:
+            return False
 
-        scored = []
+        # Same outgoing road and same target cell definitely conflicts.
+        if a.to_edge == b.to_edge and a.to_cell == b.to_cell:
+            return True
 
-        for r in requests:
-            incoming_angle = self.edge_angle_toward_node(r.from_edge)
-            blockers_on_right = 0
+        # Same outgoing road with very close entry positions conflicts.
+        if a.to_edge == b.to_edge and abs(a.to_cell - b.to_cell) <= 1:
+            return True
 
-            for other in requests:
-                if other is r:
-                    continue
+        # Left turns conflict with straight/right movements from other approaches.
+        if a.turn_type == "left" and b.turn_type in ("straight", "right"):
+            return True
+        if b.turn_type == "left" and a.turn_type in ("straight", "right"):
+            return True
 
-                other_angle = self.edge_angle_toward_node(other.from_edge)
-                diff = normalize_angle(other_angle - incoming_angle)
+        # Opposing left turns are allowed.
+        # Parallel straight movements are allowed.
+        return False
 
-                # Right side approximation: other approach is clockwise from us.
-                if 0 < diff < np.pi:
-                    blockers_on_right += 1
-
-            scored.append((blockers_on_right, r))
-
-        best_score = min(score for score, _ in scored)
-        candidates = [r for score, r in scored if score == best_score]
-        return random.choice(candidates)
-
-    def apply_junction_results(self, new_roads, accepted, rejected):
+    def right_hand_score(self, plan, competing_plans):
         """
-        Apply accepted junction movements and keep rejected cars at edge ends.
+        Lower score wins. More cars on your right means worse priority.
         """
-        for r in accepted:
-            car = self.cars.get(r.car_id)
-            if car is None:
+        score = 0
+        a_angle = self.edge_angle_toward_node(plan.from_edge)
+
+        for other in competing_plans:
+            if other is plan:
+                continue
+            b_angle = self.edge_angle_toward_node(other.from_edge)
+            diff = normalize_angle(b_angle - a_angle)
+            if 0 < diff < np.pi:
+                score += 1
+
+        return score
+
+    def turn_priority(self, turn_type):
+        # Higher is better.
+        if turn_type == "right":
+            return 3
+        if turn_type == "straight":
+            return 2
+        if turn_type == "left":
+            return 1
+        if turn_type == "uturn":
+            return 0
+        return 0
+
+    def turn_type(self, from_edge, to_edge):
+        if to_edge == self.reverse_edge_idx(from_edge):
+            return "uturn"
+
+        a = self.edge_angle_toward_node(from_edge)
+        b = self.edge_angle_away_from_node(to_edge)
+        diff = signed_angle_diff(a, b)
+
+        # Coordinates are geographic-ish; this is an approximation.
+        if abs(diff) < np.pi / 4:
+            return "straight"
+        if diff < 0:
+            return "right"
+        return "left"
+
+    # --------------------------------------------------------
+    # Apply movements
+    # --------------------------------------------------------
+
+    def apply_plans(self, internal_plans, accepted_junction, rejected_junction):
+        new_roads = [[NSEMPTY] * len(road) for road in self.roads]
+
+        # Apply internal moves first, front-to-back by target cell.
+        internal_plans = sorted(internal_plans, key=lambda p: (p.to_edge, -p.to_cell))
+        for plan in internal_plans:
+            if plan.car_id not in self.cars:
+                continue
+            self.place_or_block_internal(new_roads, plan)
+
+        # Apply accepted junction movements.
+        for plan in accepted_junction:
+            if plan.car_id not in self.cars:
                 continue
 
-            if r.to_edge is None:
-                self.block_at_edge_end(new_roads, r)
+            if plan.turn_type == "exit":
+                del self.cars[plan.car_id]
+                self.finished_cars += 1
                 continue
 
-            next_road = new_roads[r.to_edge]
-            target = min(r.target_cell, len(next_road) - 1)
+            target_road = new_roads[plan.to_edge]
+            target_cell = min(max(plan.to_cell, 0), len(target_road) - 1)
 
-            if target >= 0 and next_road[target] == NSEMPTY:
-                next_road[target] = r.car_id
+            if target_road[target_cell] == NSEMPTY:
+                target_road[target_cell] = plan.car_id
+                car = self.cars[plan.car_id]
                 car.path_pos += 1
+                self.accepted_junction_moves += 1
             else:
-                self.block_at_edge_end(new_roads, r)
+                self.block_at_edge_end(new_roads, plan)
+                self.blocked_junction_moves += 1
 
-        for r in rejected:
-            if r.car_id in self.cars:
-                self.block_at_edge_end(new_roads, r)
+        # Rejected junction movements stay at the end of their current edge.
+        for plan in rejected_junction:
+            if plan.car_id in self.cars:
+                self.block_at_edge_end(new_roads, plan)
+                self.blocked_junction_moves += 1
 
-    def block_at_edge_end(self, new_roads, request):
-        """
-        Keep a car at the end of its current edge if it cannot enter junction.
-        """
-        road = new_roads[request.from_edge]
-        car = self.cars.get(request.car_id)
+        self.roads = new_roads
+
+    def place_or_block_internal(self, new_roads, plan):
+        road = new_roads[plan.to_edge]
+        car = self.cars[plan.car_id]
+
+        if road[plan.to_cell] == NSEMPTY:
+            road[plan.to_cell] = plan.car_id
+            self.internal_moves += 1
+            return
+
+        # Place as far forward as possible between old and target.
+        for k in range(plan.to_cell - 1, plan.from_cell - 1, -1):
+            if road[k] == NSEMPTY:
+                road[k] = plan.car_id
+                car.speed = max(0, k - plan.from_cell)
+                return
+
+        # Last fallback.
+        if road[plan.from_cell] == NSEMPTY:
+            road[plan.from_cell] = plan.car_id
+            car.speed = 0
+
+    def block_at_edge_end(self, new_roads, plan):
+        road = new_roads[plan.from_edge]
+        car = self.cars.get(plan.car_id)
         if car is None:
             return
 
         for pos in range(len(road) - 1, -1, -1):
             if road[pos] == NSEMPTY:
-                road[pos] = request.car_id
+                road[pos] = plan.car_id
                 car.speed = 0
                 return
 
-        # Extremely rare fallback: the edge is fully occupied in new_roads.
-        # Keep the car alive but do not place it; this should not happen if the
-        # update is collision-free. We place it at the old cell if possible.
-        old = min(request.old_cell, len(road) - 1)
+        old = min(plan.from_cell, len(road) - 1)
         if road[old] == NSEMPTY:
-            road[old] = request.car_id
+            road[old] = plan.car_id
             car.speed = 0
 
     def step(
@@ -728,12 +914,14 @@ class GraphRoadNetwork:
         boundary_probability=0.7,
         boundary_sources="inout",
         boundary_destinations="inout",
+        allow_u_turn=False,
+        record_snapshot=False,
+        t=None,
     ):
         self.update_speeds(vmax=vmax, p=p)
-        new_roads, requests = self.collect_movements()
-        accepted, rejected = self.resolve_junction_requests(requests)
-        self.apply_junction_results(new_roads, accepted, rejected)
-        self.roads = new_roads
+        internal_plans, junction_plans = self.plan_movements(allow_u_turn=allow_u_turn)
+        accepted, rejected = self.resolve_junctions(junction_plans)
+        self.apply_plans(internal_plans, accepted, rejected)
 
         if injection_rate > 0:
             self.random_inject(
@@ -744,22 +932,68 @@ class GraphRoadNetwork:
                 boundary_destinations=boundary_destinations,
             )
 
+        if record_snapshot:
+            self.record_snapshot(t=t)
+
     # --------------------------------------------------------
-    # Geometry for right-hand rule and plotting
+    # Geometry
     # --------------------------------------------------------
 
     def edge_angle_toward_node(self, edge_idx):
-        """
-        Angle of an incoming edge in the direction of travel, toward its target.
-        """
+        u, v = self.edges[edge_idx]
+        x1, y1 = self.pos[u]
+        x2, y2 = self.pos[v]
+        return np.arctan2(y2 - y1, x2 - x1)
+
+    def edge_angle_away_from_node(self, edge_idx):
         u, v = self.edges[edge_idx]
         x1, y1 = self.pos[u]
         x2, y2 = self.pos[v]
         return np.arctan2(y2 - y1, x2 - x1)
 
     # --------------------------------------------------------
-    # Diagnostics
+    # Snapshots and diagnostics
     # --------------------------------------------------------
+
+    def record_snapshot(self, t=None):
+        cars_state = {}
+        edge_counts = [0] * len(self.roads)
+        edge_speed_sum = [0.0] * len(self.roads)
+
+        for ei, road in enumerate(self.roads):
+            for ci, car_id in enumerate(road):
+                if car_id == NSEMPTY or car_id not in self.cars:
+                    continue
+
+                car = self.cars[car_id]
+                cars_state[car_id] = {
+                    "edge": ei,
+                    "cell": ci,
+                    "speed": car.speed,
+                    "origin": car.origin,
+                    "destination": car.destination,
+                }
+                edge_counts[ei] += 1
+                edge_speed_sum[ei] += car.speed
+
+        edge_density = [edge_counts[i] / len(self.roads[i]) for i in range(len(self.roads))]
+        edge_mean_speed = [
+            edge_speed_sum[i] / edge_counts[i] if edge_counts[i] else 0.0
+            for i in range(len(self.roads))
+        ]
+
+        self.snapshots.append(
+            {
+                "t": t,
+                "cars": cars_state,
+                "edge_counts": edge_counts,
+                "edge_density": edge_density,
+                "edge_mean_speed": edge_mean_speed,
+                "total_cars": sum(edge_counts),
+                "finished_cars": self.finished_cars,
+                "spawned_cars": self.spawned_cars,
+            }
+        )
 
     def total_cars_on_network(self):
         return sum(1 for road in self.roads for cell in road if cell != NSEMPTY)
@@ -768,15 +1002,25 @@ class GraphRoadNetwork:
         return [sum(1 for cell in road if cell != NSEMPTY) for road in self.roads]
 
     def edge_densities(self):
-        return [
-            sum(1 for cell in road if cell != NSEMPTY) / len(road)
+        return [sum(1 for cell in road if cell != NSEMPTY) / len(road) for road in self.roads]
+
+    def edge_mean_speeds(self):
+        values = []
+        for road in self.roads:
+            speeds = [self.cars[cell].speed for cell in road if cell != NSEMPTY and cell in self.cars]
+            values.append(sum(speeds) / len(speeds) if speeds else 0.0)
+        return values
+
+    def mean_speed(self):
+        speeds = [
+            self.cars[cell].speed
             for road in self.roads
+            for cell in road
+            if cell != NSEMPTY and cell in self.cars
         ]
+        return sum(speeds) / len(speeds) if speeds else 0.0
 
     def routing_diagnostics(self, samples=200):
-        """
-        Quick sanity check for OD reachability.
-        """
         if not self.in_nodes or not self.out_nodes:
             print("No in_nodes or out_nodes defined.")
             return
@@ -791,7 +1035,7 @@ class GraphRoadNetwork:
             d = random.choice(destinations)
             if o == d:
                 continue
-            path = self.shortest_path(o, d)
+            path = self.random_path(o, d)
             if path is None:
                 failed += 1
             else:
@@ -809,6 +1053,11 @@ class GraphRoadNetwork:
 
 def normalize_angle(angle):
     return angle % (2 * np.pi)
+
+
+def signed_angle_diff(a, b):
+    """Return signed angle difference b-a in [-pi, pi]."""
+    return (b - a + np.pi) % (2 * np.pi) - np.pi
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -856,9 +1105,6 @@ def color_cell_graph(network, cell):
         return (0, 0, 0)
     return color_speed(car.speed)
 
-def reverse_edge_idx(self, edge_idx):
-    u, v = self.edges[edge_idx]
-    return self.edge_to_idx.get((v, u))
 
 def simulate_road(highway, iters=500, vmax=5, p=0.3, output="nasch.png"):
     road = highway[:]
@@ -867,34 +1113,30 @@ def simulate_road(highway, iters=500, vmax=5, p=0.3, output="nasch.png"):
     for t in range(iters):
         for x, v in enumerate(road):
             img.putpixel((x, t), color_speed(v))
-
         road = step_road(road, vmax=vmax, p=p, circular=True)
 
     img.save(output)
     print(f"Saved {output}")
 
 
-def flatten_network(network):
-    flat = []
-    for road in network.roads:
-        flat.extend(road)
-    return flat
-
-
 def simulate_graph_with_image(
     G,
     network,
     iters=500,
-    save_image_every=10,
+    save_image_every=50,
     vmax=5,
     p=0.3,
-    injection_rate=0.2,
+    injection_rate=0.05,
     output="figures",
-    max_new_cars=None,
+    max_new_cars=2,
     boundary_probability=0.7,
     boundary_sources="inout",
     boundary_destinations="inout",
+    allow_u_turn=False,
+    record_snapshots=True,
 ):
+    os.makedirs(output, exist_ok=True)
+
     width = sum(len(road) for road in network.roads)
     img = Image.new("RGB", (width, iters), (255, 255, 255))
 
@@ -913,21 +1155,36 @@ def simulate_graph_with_image(
             boundary_probability=boundary_probability,
             boundary_sources=boundary_sources,
             boundary_destinations=boundary_destinations,
+            allow_u_turn=allow_u_turn,
+            record_snapshot=record_snapshots,
+            t=t,
         )
-        if (t + 1) % save_image_every == 0:
-            plot_network_density(G, network, output=os.path.join(output, f'network_density_{t}.png'), use_density=True)
-        
 
-    img.save(os.path.join(output, 'nasch_graph.png'))
-    print(f"Saved {output}")
+        if save_image_every and (t + 1) % save_image_every == 0:
+            plot_network_density(
+                G,
+                network,
+                output=os.path.join(output, f"network_density_{t + 1}.png"),
+                use_density=True,
+            )
+            plot_network_speed(
+                G,
+                network,
+                output=os.path.join(output, f"network_speed_{t + 1}.png"),
+            )
+            print(
+                t + 1,
+                "cars:", network.total_cars_on_network(),
+                "finished:", network.finished_cars,
+                "mean speed:", round(network.mean_speed(), 2),
+            )
+
+    img.save(os.path.join(output, "nasch_graph.png"))
+    print(f"Saved {os.path.join(output, 'nasch_graph.png')}")
 
 
 def plot_network(G, output=None):
-    pos = {}
-    for n, d in G.nodes(data=True):
-        lat = float(d["x"])
-        lon = float(d["y"])
-        pos[n] = (lat, lon)
+    pos = {n: (float(d["x"]), float(d["y"])) for n, d in G.nodes(data=True)}
 
     fig, ax = plt.subplots(figsize=(10, 10))
     nx.draw(
@@ -946,6 +1203,7 @@ def plot_network(G, output=None):
     plt.tight_layout()
 
     if output:
+        os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
         plt.savefig(output, dpi=200)
         plt.close(fig)
         print(f"Saved {output}")
@@ -953,24 +1211,24 @@ def plot_network(G, output=None):
         plt.show()
 
 
-def plot_network_density(
-    G,
-    network,
-    output="figures/network_density.png",
-    use_density=True,
-):
-    pos = {}
-    for n, d in G.nodes(data=True):
-        lat = float(d["x"])
-        lon = float(d["y"])
-        pos[n] = (lat, lon)
-
+def plot_network_density(G, network, output="figures/network_density.png", use_density=True):
     if use_density:
         values = network.edge_densities()
         label = "Car density on street"
     else:
         values = network.edge_car_counts()
         label = "Number of cars on street"
+
+    plot_network_edge_values(G, network, values, label, output, title="Road Network Colored by Traffic")
+
+
+def plot_network_speed(G, network, output="figures/network_speed.png"):
+    values = network.edge_mean_speeds()
+    plot_network_edge_values(G, network, values, "Mean car speed on street", output, title="Road Network Colored by Speed")
+
+
+def plot_network_edge_values(G, network, values, label, output, title):
+    pos = {n: (float(d["x"]), float(d["y"])) for n, d in G.nodes(data=True)}
 
     vmax_value = max(values) if values else 1
     if vmax_value == 0:
@@ -991,26 +1249,36 @@ def plot_network_density(
         ax=ax,
     )
 
-    nx.draw_networkx_edges(
-        G,
-        pos,
-        edge_color=edge_colors,
-        width=2.0,
-        arrows=False,
-        ax=ax,
+    # For undirected G, NetworkX draws fewer edges than network.edges if we doubled directions.
+    # Therefore draw directly from network.edges so values align with simulated roads.
+    edge_collection = mpl.collections.LineCollection(
+        [[pos[u], pos[v]] for u, v in network.edges],
+        colors=edge_colors,
+        linewidths=1.7,
+        alpha=0.95,
     )
+    ax.add_collection(edge_collection)
 
     sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax)
     cbar.set_label(label)
 
-    ax.set_title("Road Network Colored by Traffic")
+    ax.set_title(title)
     ax.set_aspect("equal")
     ax.axis("off")
+    ax.autoscale()
     plt.tight_layout()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     plt.savefig(output, dpi=200)
     plt.close(fig)
+    print(f"Saved {output}")
+
+
+def save_snapshots_json(network, output="figures/snapshots.json"):
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    with open(output, "w") as f:
+        json.dump(network.snapshots, f)
     print(f"Saved {output}")
 
 
@@ -1022,7 +1290,8 @@ def load_graph_network(
     gexf_path="data/erd.gexf",
     inout_path="data/inout.json",
     cell_length_m=7.0,
-    min_cells=1,
+    min_cells=3,
+    k_paths=3,
 ):
     with open(inout_path) as f:
         inout = json.load(f)
@@ -1034,36 +1303,8 @@ def load_graph_network(
         inout=inout,
         cell_length_m=cell_length_m,
         min_cells=min_cells,
+        k_paths=k_paths,
     )
-
-    return G, network
-
-
-def simulate_graph(
-    gexf_path="data/erd.gexf",
-    inout_path="data/inout.json",
-    iters=500,
-    vmax=5,
-    p=0.3,
-    injection_rate=0.2,
-    initial_density=0.0,
-    cell_length_m=7.0,
-    min_cells=1,
-    output="figures",
-):
-    G, network = load_graph_network(
-        gexf_path=gexf_path,
-        inout_path=inout_path,
-        cell_length_m=cell_length_m,
-        min_cells=min_cells,
-    )
-
-    if initial_density > 0:
-        network.populate_random_od(density=initial_density, vmax=vmax)
-
-    for _ in range(iters):
-        network.step(vmax=vmax, p=p, injection_rate=injection_rate, max_new_cars=None)
-        plot_network_density(G, network, output=f"{output}/network_density_{_}.png", use_density=True)
 
     return G, network
 
@@ -1078,34 +1319,62 @@ if __name__ == "__main__":
         inout_path="data/inout.json",
         cell_length_m=7.0,
         min_cells=3,
+        k_paths=4,
     )
+
+    network.routing_diagnostics(samples=500)
 
     plot_network(G, output="figures/network.png")
 
-    # Optional initial OD-based distribution.
-    # Each initialized car gets a real destination and path.
     network.populate_random_od(
-        density=0.05,
+        density=0.02,
         vmax=5,
-    )
-
-    simulate_graph_with_image(
-        network,
-        iters=500,
-        vmax=5,
-        p=0.3,
-        injection_rate=0.8,
-        output="figures/",
+        destinations_mode="inout",
     )
 
     plot_network_density(
         G,
         network,
-        output="figures/network_density.png",
+        output="figures/network_density_init.png",
         use_density=True,
     )
+
+    simulate_graph_with_image(
+        G,
+        network,
+        iters=1000,
+        save_image_every=100,
+        vmax=5,
+        p=0.3,
+        injection_rate=0.05,
+        max_new_cars=2,
+        boundary_probability=0.7,
+        boundary_sources="inout",
+        boundary_destinations="inout",
+        allow_u_turn=False,
+        record_snapshots=True,
+        output="figures",
+    )
+
+    plot_network_density(
+        G,
+        network,
+        output="figures/network_density_final.png",
+        use_density=True,
+    )
+
+    plot_network_speed(
+        G,
+        network,
+        output="figures/network_speed_final.png",
+    )
+
+    save_snapshots_json(network, output="figures/snapshots.json")
 
     print("Cars currently on network:", network.total_cars_on_network())
     print("Cars spawned:", network.spawned_cars)
     print("Cars finished:", network.finished_cars)
     print("Failed spawns:", network.failed_spawns)
+    print("Accepted junction moves:", network.accepted_junction_moves)
+    print("Blocked junction moves:", network.blocked_junction_moves)
+    print("Mean speed:", round(network.mean_speed(), 2))
