@@ -57,5 +57,14 @@ experiment runs. Change the `SAVE_DIR` value in the first code cell to put all
 figures, `config.json`, `summary.json`, and `snapshots.json` into a new output
 folder.
 
+The final notebook cell can also create two GIF animations from the recorded
+snapshots:
+
+- `traffic_density.gif`: road colors change over time based on density.
+- `moving_cars.gif`: individual vehicles move as dots colored by speed.
+
+For high-density runs, the density animation is usually clearer. For short
+low-density demonstrations, the moving-dot animation is more intuitive.
+
 For a ready-to-use project explanation and slide-style outline, see
 `PRESENTATION.md`.

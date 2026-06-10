@@ -8,6 +8,7 @@ os.environ.setdefault("MPLCONFIGDIR", os.path.join("/tmp", "matplotlib"))
 
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+from matplotlib.animation import FuncAnimation, PillowWriter
 import networkx as nx
 import igraph as ig
 import numpy as np
@@ -1549,6 +1550,218 @@ def plot_network_edge_values(G, network, values, label, output, title):
     plt.tight_layout()
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     plt.savefig(output, dpi=200)
+    plt.close(fig)
+    print(f"Saved {output}")
+
+
+def snapshot_frame_indices(snapshots, every=1, max_frames=None):
+    if not snapshots:
+        raise ValueError("No snapshots available. Run with record_snapshots=True first.")
+
+    every = max(1, int(every))
+    indices = list(range(0, len(snapshots), every))
+
+    if max_frames is not None and len(indices) > max_frames:
+        selected = np.linspace(0, len(indices) - 1, int(max_frames), dtype=int)
+        indices = [indices[i] for i in selected]
+
+    return indices
+
+
+def draw_boundary_nodes(ax, network, pos):
+    in_points = [pos[n] for n in network.in_nodes if n in pos]
+    out_points = [pos[n] for n in network.out_nodes if n in pos]
+
+    if in_points:
+        xs, ys = zip(*in_points)
+        ax.scatter(xs, ys, s=45, color="#2563eb", edgecolor="white", linewidth=0.6, label="entry")
+
+    if out_points:
+        xs, ys = zip(*out_points)
+        ax.scatter(xs, ys, s=45, color="#dc2626", edgecolor="white", linewidth=0.6, label="exit")
+
+
+def animate_network_density(
+    G,
+    network,
+    output="figures/traffic_density.gif",
+    every=5,
+    fps=8,
+    max_frames=200,
+    use_density=True,
+):
+    """
+    Animate edge density or car count over the road network.
+
+    Run the simulation with record_snapshots=True before calling this function.
+    GIF output is used so no external ffmpeg installation is required.
+    """
+    frames = snapshot_frame_indices(network.snapshots, every=every, max_frames=max_frames)
+    value_key = "edge_density" if use_density else "edge_counts"
+    label = "Road density" if use_density else "Cars on road"
+
+    pos = {n: (float(d["x"]), float(d["y"])) for n, d in G.nodes(data=True)}
+    segments = [[pos[u], pos[v]] for u, v in network.edges]
+
+    if use_density:
+        vmax_value = 1.0
+    else:
+        vmax_value = max(max(snapshot[value_key]) for snapshot in network.snapshots)
+        vmax_value = max(1, vmax_value)
+
+    norm = mpl.colors.Normalize(vmin=0, vmax=vmax_value)
+    cmap = plt.cm.magma_r
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    edge_collection = mpl.collections.LineCollection(
+        segments,
+        linewidths=2.0,
+        alpha=0.95,
+    )
+    ax.add_collection(edge_collection)
+
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        node_size=5,
+        node_color="black",
+        alpha=0.25,
+        ax=ax,
+    )
+    draw_boundary_nodes(ax, network, pos)
+
+    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.01)
+    cbar.set_label(label)
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.autoscale()
+    if network.in_nodes or network.out_nodes:
+        ax.legend(loc="upper right", frameon=True)
+
+    def update(frame_idx):
+        snapshot = network.snapshots[frame_idx]
+        values = snapshot[value_key]
+        edge_collection.set_color([cmap(norm(value)) for value in values])
+        ax.set_title(
+            f"{label} at t={snapshot['t']} | cars={snapshot['total_cars']} | "
+            f"finished={snapshot['finished_cars']}"
+        )
+        return [edge_collection]
+
+    update(frames[0])
+    anim = FuncAnimation(fig, update, frames=frames, interval=1000 / fps, blit=False)
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    anim.save(output, writer=PillowWriter(fps=fps))
+    plt.close(fig)
+    print(f"Saved {output}")
+
+
+def car_xy_from_snapshot(network, car_state):
+    edge_idx = int(car_state["edge"])
+    cell_idx = int(car_state["cell"])
+    u, v = network.edges[edge_idx]
+    x1, y1 = network.pos[u]
+    x2, y2 = network.pos[v]
+
+    road_len = len(network.roads[edge_idx])
+    alpha = (cell_idx + 0.5) / road_len
+    x = x1 + alpha * (x2 - x1)
+    y = y1 + alpha * (y2 - y1)
+    return x, y
+
+
+def animate_moving_cars(
+    G,
+    network,
+    output="figures/moving_cars.gif",
+    every=5,
+    fps=8,
+    max_frames=200,
+    max_cars=None,
+    car_size=12,
+):
+    """
+    Animate individual cars as moving dots on the map.
+
+    This is most readable for lower-density runs. For crowded simulations, use
+    max_cars to cap the number of plotted vehicles or prefer density animation.
+    """
+    frames = snapshot_frame_indices(network.snapshots, every=every, max_frames=max_frames)
+    pos = {n: (float(d["x"]), float(d["y"])) for n, d in G.nodes(data=True)}
+    segments = [[pos[u], pos[v]] for u, v in network.edges]
+
+    max_speed = 1
+    for snapshot in network.snapshots:
+        for car_state in snapshot["cars"].values():
+            max_speed = max(max_speed, int(car_state["speed"]))
+
+    norm = mpl.colors.Normalize(vmin=0, vmax=max_speed)
+    cmap = plt.cm.turbo
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    road_collection = mpl.collections.LineCollection(
+        segments,
+        colors="#b8b8b8",
+        linewidths=0.8,
+        alpha=0.55,
+    )
+    ax.add_collection(road_collection)
+
+    draw_boundary_nodes(ax, network, pos)
+    cars_artist = ax.scatter(
+        [],
+        [],
+        s=car_size,
+        c=[],
+        cmap=cmap,
+        norm=norm,
+        alpha=0.9,
+        linewidth=0,
+    )
+
+    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.01)
+    cbar.set_label("Car speed")
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.autoscale()
+    if network.in_nodes or network.out_nodes:
+        ax.legend(loc="upper right", frameon=True)
+
+    def update(frame_idx):
+        snapshot = network.snapshots[frame_idx]
+        car_items = list(snapshot["cars"].items())
+        if max_cars is not None:
+            car_items = car_items[:max_cars]
+
+        xy = []
+        speeds = []
+        for _, car_state in car_items:
+            xy.append(car_xy_from_snapshot(network, car_state))
+            speeds.append(int(car_state["speed"]))
+
+        if xy:
+            cars_artist.set_offsets(np.array(xy))
+            cars_artist.set_array(np.array(speeds))
+        else:
+            cars_artist.set_offsets(np.empty((0, 2)))
+            cars_artist.set_array(np.array([]))
+
+        ax.set_title(
+            f"Moving cars at t={snapshot['t']} | cars={snapshot['total_cars']} | "
+            f"finished={snapshot['finished_cars']}"
+        )
+        return [cars_artist]
+
+    update(frames[0])
+    anim = FuncAnimation(fig, update, frames=frames, interval=1000 / fps, blit=False)
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    anim.save(output, writer=PillowWriter(fps=fps))
     plt.close(fig)
     print(f"Saved {output}")
 

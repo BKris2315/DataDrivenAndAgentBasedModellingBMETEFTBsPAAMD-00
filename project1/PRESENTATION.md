@@ -547,6 +547,23 @@ map stable and shows congestion spreading or clearing.
 
 ---
 
+## Implemented Animations
+
+The project now includes two snapshot-based GIF generators.
+
+```python
+animate_network_density(G, network, output="traffic_density.gif")
+animate_moving_cars(G, network, output="moving_cars.gif")
+```
+
+Use `traffic_density.gif` for high-density or long runs because it stays readable
+even when thousands of cars are present.
+
+Use `moving_cars.gif` for short demonstrations because individual vehicle motion
+is easier for the audience to understand.
+
+---
+
 ## Animation Idea: Moving Cars on the Map
 
 Animate individual cars as points moving along road segments.
