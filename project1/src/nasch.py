@@ -3,6 +3,9 @@ import json
 import random
 from dataclasses import dataclass
 
+# The managed workspace may not allow Matplotlib to write into the user home.
+os.environ.setdefault("MPLCONFIGDIR", os.path.join("/tmp", "matplotlib"))
+
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import networkx as nx
@@ -126,6 +129,9 @@ class GraphRoadNetwork:
         in_nodes=None,
         out_nodes=None,
         k_paths=3,
+        congestion_weight=4.0,
+        reroute_at_junctions=True,
+        reroute_improvement_threshold=0.05,
     ):
         self.nodes = list(nodes)
         self.edges = list(edges)
@@ -139,6 +145,9 @@ class GraphRoadNetwork:
         self.pos = pos or {}
         self.edge_length_m = edge_length_m or [float(L) for L in edge_lengths]
         self.k_paths = k_paths
+        self.congestion_weight = congestion_weight
+        self.reroute_at_junctions = reroute_at_junctions
+        self.reroute_improvement_threshold = reroute_improvement_threshold
 
         self.node_to_idx = {n: i for i, n in enumerate(self.nodes)}
         self.edge_to_idx = {e: i for i, e in enumerate(self.edges)}
@@ -179,6 +188,9 @@ class GraphRoadNetwork:
         min_cells=3,
         bidirectional_if_undirected=True,
         k_paths=3,
+        congestion_weight=4.0,
+        reroute_at_junctions=True,
+        reroute_improvement_threshold=0.05,
     ):
         if min_cells is None:
             min_cells = 1
@@ -190,9 +202,9 @@ class GraphRoadNetwork:
         pos = {}
 
         for n, d in G.nodes(data=True):
-            lat = float(d["x"])
-            lon = float(d["y"])
-            pos[n] = (lat, lon)
+            lon = float(d["x"])
+            lat = float(d["y"])
+            pos[n] = (lon, lat)
 
         def add_edge(u, v, length_m):
             edges.append((u, v))
@@ -205,10 +217,10 @@ class GraphRoadNetwork:
             if "length" in data:
                 length_m = float(data["length"])
             else:
-                lat1 = float(G.nodes[u]["x"])
-                lon1 = float(G.nodes[u]["y"])
-                lat2 = float(G.nodes[v]["x"])
-                lon2 = float(G.nodes[v]["y"])
+                lon1 = float(G.nodes[u]["x"])
+                lat1 = float(G.nodes[u]["y"])
+                lon2 = float(G.nodes[v]["x"])
+                lat2 = float(G.nodes[v]["y"])
                 length_m = haversine_m(lat1, lon1, lat2, lon2)
 
             add_edge(u, v, length_m)
@@ -244,6 +256,9 @@ class GraphRoadNetwork:
             in_nodes=in_nodes,
             out_nodes=out_nodes,
             k_paths=k_paths,
+            congestion_weight=congestion_weight,
+            reroute_at_junctions=reroute_at_junctions,
+            reroute_improvement_threshold=reroute_improvement_threshold,
         )
 
     # --------------------------------------------------------
@@ -300,40 +315,45 @@ class GraphRoadNetwork:
         self.path_cache[key] = path
         return path
 
-    def random_path(self, origin, destination):
-        """
-        Fast route choice using igraph.
-
-        For speed, this defaults to shortest path. If k_paths > 1, it creates
-        variation by adding small random penalties to edge weights and caching
-        a few alternatives per OD pair. This is much faster than
-        networkx.shortest_simple_paths for repeated simulation use.
-        """
+    def candidate_paths(self, origin, destination):
+        """Return cached short route alternatives for an origin-destination pair."""
         if self.ig_graph is None or origin == destination:
-            return None
+            return []
 
-        key = (origin, destination, self.k_paths)
+        key = (origin, destination, "candidates", self.k_paths)
         if key in self.path_cache:
-            paths = self.path_cache[key]
-            return random.choice(paths) if paths else None
+            return self.path_cache[key]
 
         if origin not in self.node_to_ig or destination not in self.node_to_ig:
             self.path_cache[key] = []
-            return None
+            return []
 
         source = self.node_to_ig[origin]
         target = self.node_to_ig[destination]
         paths = []
 
+        path_id_lists = self.ig_graph.get_k_shortest_paths(
+            source,
+            to=target,
+            k=max(1, self.k_paths),
+            weights="length",
+            output="vpath",
+        )
+
+        for path_ids in path_id_lists:
+            if path_ids and len(path_ids) >= 2:
+                path = [self.ig_to_node[i] for i in path_ids]
+                if path not in paths:
+                    paths.append(path)
+
+        # If k-shortest produced few alternatives, add some mildly perturbed
+        # shortest paths. This helps on networks with many near-equivalent roads.
         base_lengths = np.array(self.ig_graph.es["length"], dtype=float)
-        tries = max(1, self.k_paths)
+        tries = max(0, self.k_paths - len(paths)) * 2
 
         for attempt in range(tries):
-            if attempt == 0 or self.k_paths <= 1:
-                weights = base_lengths
-            else:
-                noise = np.random.uniform(0.95, 1.25, size=len(base_lengths))
-                weights = base_lengths * noise
+            noise = np.random.uniform(0.9, 1.3, size=len(base_lengths))
+            weights = base_lengths * noise
 
             path_ids = self.ig_graph.get_shortest_paths(
                 source,
@@ -348,63 +368,230 @@ class GraphRoadNetwork:
                     paths.append(path)
 
         self.path_cache[key] = paths
-        return random.choice(paths) if paths else None
+        return paths
 
-    def random_node_with_outgoing_edge(self):
-        candidates = [n for n in self.nodes if self.out_edges.get(n)]
+    def path_edge_indices(self, path):
+        edge_indices = []
+        for u, v in zip(path[:-1], path[1:]):
+            edge_idx = self.edge_to_idx.get((u, v))
+            if edge_idx is None:
+                return None
+            edge_indices.append(edge_idx)
+        return edge_indices
+
+    def route_score(self, path, avoid_blocked_start=False):
+        """
+        Score a route using physical length and current traffic density.
+
+        A longer but emptier route can beat a shorter congested one. The density
+        term is squared so almost-empty roads stay close to pure shortest-path
+        routing, while very full roads become unattractive quickly.
+        """
+        edge_indices = self.path_edge_indices(path)
+        if edge_indices is None:
+            return float("inf")
+
+        score = 0.0
+        for position, edge_idx in enumerate(edge_indices):
+            road = self.roads[edge_idx]
+            length_m = self.edge_length_m[edge_idx]
+            density = sum(1 for cell in road if cell != NSEMPTY) / len(road)
+            score += length_m * (1.0 + self.congestion_weight * density * density)
+
+            if avoid_blocked_start and position == 0 and road[0] != NSEMPTY:
+                score += length_m * (10.0 + self.congestion_weight)
+
+        return score
+
+    def random_path(
+        self,
+        origin,
+        destination,
+        avoid_blocked_start=False,
+        forbidden_first_edge=None,
+    ):
+        """
+        Congestion-aware route choice.
+
+        The method keeps the old name because the rest of the simulator calls it
+        as the route-choice hook. It now checks several candidate routes and
+        chooses one with the best current density-adjusted score.
+        """
+        paths = self.candidate_paths(origin, destination)
+        if not paths:
+            return None
+
+        if forbidden_first_edge is not None:
+            allowed_paths = []
+            for path in paths:
+                edge_indices = self.path_edge_indices(path)
+                if edge_indices and edge_indices[0] != forbidden_first_edge:
+                    allowed_paths.append(path)
+            paths = allowed_paths
+            if not paths:
+                return None
+
+        scored_paths = [
+            (self.route_score(path, avoid_blocked_start=avoid_blocked_start), path)
+            for path in paths
+        ]
+        scored_paths = [(score, path) for score, path in scored_paths if np.isfinite(score)]
+        if not scored_paths:
+            return None
+
+        best_score = min(score for score, _ in scored_paths)
+        tolerance = max(1.0, best_score * 0.02)
+        best_paths = [
+            path for score, path in scored_paths
+            if score <= best_score + tolerance
+        ]
+        return random.choice(best_paths)
+
+    def nodes_for_role(self, role):
+        if role == "in":
+            return set(self.in_nodes)
+        if role == "out":
+            return set(self.out_nodes)
+        if role == "inout":
+            return set(self.in_nodes | self.out_nodes)
+        if role == "all":
+            return set(self.nodes)
+        return set()
+
+    def internal_nodes(self):
+        boundary = self.in_nodes | self.out_nodes
+        return [n for n in self.nodes if n not in boundary]
+
+    def random_node_with_outgoing_edge(self, candidates=None):
+        if candidates is None:
+            candidates = self.nodes
+        candidates = [n for n in candidates if self.out_edges.get(n)]
         if not candidates:
             return None
         return random.choice(candidates)
 
-    def random_reachable_destination_from(self, origin, allowed_destinations=None, max_tries=50):
+    def random_reachable_destination_and_path_from(
+        self,
+        origin,
+        allowed_destinations=None,
+        max_tries=50,
+        avoid_blocked_start=False,
+    ):
         if allowed_destinations is None:
             allowed_destinations = self.nodes
 
         allowed_destinations = list(allowed_destinations)
         if not allowed_destinations:
-            return None
+            return None, None
 
         for _ in range(max_tries):
             destination = random.choice(allowed_destinations)
             if destination == origin:
                 continue
-            path = self.random_path(origin, destination)
+            path = self.random_path(
+                origin,
+                destination,
+                avoid_blocked_start=avoid_blocked_start,
+            )
             if path is not None and len(path) >= 2:
-                return destination
+                return destination, path
 
-        return None
+        return None, None
+
+    def random_reachable_destination_from(self, origin, allowed_destinations=None, max_tries=50):
+        destination, _ = self.random_reachable_destination_and_path_from(
+            origin,
+            allowed_destinations=allowed_destinations,
+            max_tries=max_tries,
+        )
+        return destination
+
+    def choose_destination_from_pools(
+        self,
+        origin,
+        preferred_destinations,
+        fallback_destinations=None,
+        avoid_blocked_start=False,
+    ):
+        pools = [
+            list(preferred_destinations or []),
+            list(fallback_destinations or []),
+            list(self.nodes),
+        ]
+
+        tried = set()
+        for pool in pools:
+            key = tuple(sorted(pool))
+            if not pool or key in tried:
+                continue
+            tried.add(key)
+            destination, path = self.random_reachable_destination_and_path_from(
+                origin,
+                allowed_destinations=pool,
+                avoid_blocked_start=avoid_blocked_start,
+            )
+            if destination is not None:
+                return destination, path
+
+        return None, None
 
     def choose_spawn_od(
         self,
         boundary_probability=0.7,
-        boundary_sources="inout",
-        boundary_destinations="inout",
+        boundary_sources="in",
+        boundary_destinations="out",
+        boundary_to_boundary_probability=0.85,
+        city_to_city_probability=0.8,
     ):
-        boundary_sources_set = set()
-        if boundary_sources in ("in", "inout"):
-            boundary_sources_set |= self.in_nodes
-        if boundary_sources in ("out", "inout"):
-            boundary_sources_set |= self.out_nodes
+        boundary_sources_set = self.nodes_for_role(boundary_sources)
+        boundary_destinations_set = self.nodes_for_role(boundary_destinations)
+        internal_nodes = set(self.internal_nodes())
 
-        boundary_destinations_set = set()
-        if boundary_destinations in ("in", "inout"):
-            boundary_destinations_set |= self.in_nodes
-        if boundary_destinations in ("out", "inout"):
-            boundary_destinations_set |= self.out_nodes
+        boundary_origins = [n for n in boundary_sources_set if self.out_edges.get(n)]
+        city_origins = [n for n in internal_nodes if self.out_edges.get(n)]
 
-        use_boundary = random.random() < boundary_probability
+        use_boundary = random.random() < boundary_probability or not city_origins
 
-        if use_boundary and boundary_sources_set and boundary_destinations_set:
-            origins = [n for n in boundary_sources_set if self.out_edges.get(n)]
-            random.shuffle(origins)
+        if use_boundary and boundary_origins:
+            random.shuffle(boundary_origins)
+            for origin in boundary_origins:
+                prefer_boundary_destination = random.random() < boundary_to_boundary_probability
+                if prefer_boundary_destination:
+                    preferred = boundary_destinations_set - {origin}
+                    fallback = internal_nodes
+                else:
+                    preferred = internal_nodes
+                    fallback = boundary_destinations_set - {origin}
 
-            for origin in origins:
-                destination = self.random_reachable_destination_from(
+                destination, _ = self.choose_destination_from_pools(
                     origin,
-                    allowed_destinations=boundary_destinations_set,
+                    preferred,
+                    fallback_destinations=fallback,
+                    avoid_blocked_start=True,
                 )
                 if destination is not None:
                     return origin, destination
+
+        fallback_origins = city_origins or boundary_origins
+        random.shuffle(fallback_origins)
+
+        for origin in fallback_origins:
+            prefer_city_destination = random.random() < city_to_city_probability
+            if prefer_city_destination:
+                preferred = internal_nodes - {origin}
+                fallback = boundary_destinations_set
+            else:
+                preferred = boundary_destinations_set - {origin}
+                fallback = internal_nodes
+
+            destination, _ = self.choose_destination_from_pools(
+                origin,
+                preferred,
+                fallback_destinations=fallback,
+                avoid_blocked_start=True,
+            )
+            if destination is not None:
+                return origin, destination
 
         origin = self.random_node_with_outgoing_edge()
         if origin is None:
@@ -418,7 +605,7 @@ class GraphRoadNetwork:
             self.failed_spawns += 1
             return False
 
-        path = self.random_path(origin, destination)
+        path = self.random_path(origin, destination, avoid_blocked_start=True)
         if path is None or len(path) < 2:
             self.failed_spawns += 1
             return False
@@ -454,8 +641,10 @@ class GraphRoadNetwork:
         rate=0.2,
         max_new_cars=None,
         boundary_probability=0.7,
-        boundary_sources="inout",
-        boundary_destinations="inout",
+        boundary_sources="in",
+        boundary_destinations="out",
+        boundary_to_boundary_probability=0.85,
+        city_to_city_probability=0.8,
     ):
         if max_new_cars is None:
             boundary_count = max(1, len(self.in_nodes | self.out_nodes))
@@ -469,6 +658,8 @@ class GraphRoadNetwork:
                 boundary_probability=boundary_probability,
                 boundary_sources=boundary_sources,
                 boundary_destinations=boundary_destinations,
+                boundary_to_boundary_probability=boundary_to_boundary_probability,
+                city_to_city_probability=city_to_city_probability,
             )
 
             if origin is None or destination is None:
@@ -483,7 +674,13 @@ class GraphRoadNetwork:
 
         return inserted, attempts
 
-    def populate_random_od(self, density=0.05, vmax=5, destinations_mode="out"):
+    def populate_random_od(
+        self,
+        density=0.05,
+        vmax=5,
+        destinations_mode="mixed",
+        city_to_city_probability=0.8,
+    ):
         """
         Initial cars throughout the graph.
 
@@ -491,30 +688,27 @@ class GraphRoadNetwork:
             "out"   -> destinations from out_nodes
             "inout" -> destinations from in_nodes union out_nodes
             "all"   -> destinations can be anywhere
+            "mixed" -> mostly internal destinations, sometimes boundary exits
         """
-        if destinations_mode == "out":
-            destinations = list(self.out_nodes)
-        elif destinations_mode == "inout":
-            destinations = list(self.in_nodes | self.out_nodes)
-        else:
-            destinations = list(self.nodes)
+        internal_destinations = set(self.internal_nodes())
+        boundary_destinations = set(self.in_nodes | self.out_nodes)
+        exit_destinations = set(self.out_nodes) or boundary_destinations
 
-        if not destinations:
-            destinations = list(self.nodes)
+        def destination_pools(origin):
+            if destinations_mode == "out":
+                return set(self.out_nodes) - {origin}, internal_destinations
+            if destinations_mode == "inout":
+                return boundary_destinations - {origin}, internal_destinations
+            if destinations_mode == "all":
+                return set(self.nodes) - {origin}, []
+
+            prefer_internal = random.random() < city_to_city_probability
+            if prefer_internal:
+                return internal_destinations - {origin}, exit_destinations
+            return exit_destinations - {origin}, internal_destinations
 
         for ei, road in enumerate(self.roads):
             u, v = self.edges[ei]
-
-            reachable = []
-            for destination in destinations:
-                if destination == v:
-                    continue
-                path_tail = self.random_path(v, destination)
-                if path_tail is not None and len(path_tail) >= 1:
-                    reachable.append((destination, path_tail))
-
-            if not reachable:
-                continue
 
             for cell_idx in range(len(road)):
                 if road[cell_idx] != NSEMPTY:
@@ -523,7 +717,15 @@ class GraphRoadNetwork:
                 if random.random() >= density:
                     continue
 
-                destination, path_tail = random.choice(reachable)
+                preferred, fallback = destination_pools(v)
+                destination, path_tail = self.choose_destination_from_pools(
+                    v,
+                    preferred,
+                    fallback_destinations=fallback,
+                )
+                if destination is None or path_tail is None:
+                    continue
+
                 selected_path = [u] + path_tail
 
                 if len(selected_path) < 2:
@@ -552,16 +754,62 @@ class GraphRoadNetwork:
         u, v = self.edges[edge_idx]
         return self.edge_to_idx.get((v, u))
 
-    def get_next_edge_for_car(self, car_id, current_edge, allow_u_turn=False):
-        car = self.cars[car_id]
+    def edge_density_value(self, edge_idx):
+        road = self.roads[edge_idx]
+        return sum(1 for cell in road if cell != NSEMPTY) / len(road)
 
-        if car.path_pos + 2 >= len(car.path):
+    def maybe_reroute_car_at_junction(self, car_id, current_edge, allow_u_turn=False):
+        if not self.reroute_at_junctions:
+            return
+
+        car = self.cars[car_id]
+        arrival_node = self.edges[current_edge][1]
+        if arrival_node == car.destination:
+            return
+
+        forbidden_first_edge = None
+        if not allow_u_turn:
+            forbidden_first_edge = self.reverse_edge_idx(current_edge)
+
+        new_tail = self.random_path(
+            arrival_node,
+            car.destination,
+            forbidden_first_edge=forbidden_first_edge,
+        )
+        if new_tail is None or len(new_tail) < 2:
+            return
+
+        current_tail = car.path[car.path_pos + 1:]
+        if current_tail == new_tail:
+            return
+
+        current_score = self.route_score(current_tail)
+        new_score = self.route_score(new_tail)
+        if not np.isfinite(new_score):
+            return
+
+        current_next_edge = self.get_next_edge_from_path(
+            current_tail,
+            current_edge=current_edge,
+            allow_u_turn=allow_u_turn,
+        )
+        current_next_is_crowded = (
+            current_next_edge is None
+            or self.edge_density_value(current_next_edge) >= 0.75
+        )
+        improvement = (
+            not np.isfinite(current_score)
+            or new_score < current_score * (1.0 - self.reroute_improvement_threshold)
+        )
+
+        if improvement or current_next_is_crowded:
+            car.path = car.path[:car.path_pos + 1] + new_tail
+
+    def get_next_edge_from_path(self, path, current_edge, allow_u_turn=False):
+        if len(path) < 2:
             return None
 
-        u = car.path[car.path_pos + 1]
-        v = car.path[car.path_pos + 2]
-        next_edge = self.edge_to_idx.get((u, v))
-
+        next_edge = self.edge_to_idx.get((path[0], path[1]))
         if next_edge is None:
             return None
 
@@ -569,6 +817,28 @@ class GraphRoadNetwork:
             return None
 
         return next_edge
+
+    def get_next_edge_for_car(self, car_id, current_edge, allow_u_turn=False):
+        car = self.cars[car_id]
+
+        if car.path_pos + 1 >= len(car.path):
+            return None
+
+        self.maybe_reroute_car_at_junction(
+            car_id,
+            current_edge,
+            allow_u_turn=allow_u_turn,
+        )
+
+        if car.path_pos + 2 >= len(car.path):
+            return None
+
+        next_path = car.path[car.path_pos + 1:car.path_pos + 3]
+        return self.get_next_edge_from_path(
+            next_path,
+            current_edge=current_edge,
+            allow_u_turn=allow_u_turn,
+        )
 
     def find_car_position(self, car_id):
         for ei, road in enumerate(self.roads):
@@ -912,8 +1182,10 @@ class GraphRoadNetwork:
         injection_rate=0.0,
         max_new_cars=None,
         boundary_probability=0.7,
-        boundary_sources="inout",
-        boundary_destinations="inout",
+        boundary_sources="in",
+        boundary_destinations="out",
+        boundary_to_boundary_probability=0.85,
+        city_to_city_probability=0.8,
         allow_u_turn=False,
         record_snapshot=False,
         t=None,
@@ -930,6 +1202,8 @@ class GraphRoadNetwork:
                 boundary_probability=boundary_probability,
                 boundary_sources=boundary_sources,
                 boundary_destinations=boundary_destinations,
+                boundary_to_boundary_probability=boundary_to_boundary_probability,
+                city_to_city_probability=city_to_city_probability,
             )
 
         if record_snapshot:
@@ -1130,8 +1404,10 @@ def simulate_graph_with_image(
     output="figures",
     max_new_cars=2,
     boundary_probability=0.7,
-    boundary_sources="inout",
-    boundary_destinations="inout",
+    boundary_sources="in",
+    boundary_destinations="out",
+    boundary_to_boundary_probability=0.85,
+    city_to_city_probability=0.8,
     allow_u_turn=False,
     record_snapshots=True,
 ):
@@ -1155,6 +1431,8 @@ def simulate_graph_with_image(
             boundary_probability=boundary_probability,
             boundary_sources=boundary_sources,
             boundary_destinations=boundary_destinations,
+            boundary_to_boundary_probability=boundary_to_boundary_probability,
+            city_to_city_probability=city_to_city_probability,
             allow_u_turn=allow_u_turn,
             record_snapshot=record_snapshots,
             t=t,
@@ -1292,6 +1570,9 @@ def load_graph_network(
     cell_length_m=7.0,
     min_cells=3,
     k_paths=3,
+    congestion_weight=4.0,
+    reroute_at_junctions=True,
+    reroute_improvement_threshold=0.05,
 ):
     with open(inout_path) as f:
         inout = json.load(f)
@@ -1304,6 +1585,9 @@ def load_graph_network(
         cell_length_m=cell_length_m,
         min_cells=min_cells,
         k_paths=k_paths,
+        congestion_weight=congestion_weight,
+        reroute_at_junctions=reroute_at_junctions,
+        reroute_improvement_threshold=reroute_improvement_threshold,
     )
 
     return G, network
@@ -1329,7 +1613,8 @@ if __name__ == "__main__":
     network.populate_random_od(
         density=0.02,
         vmax=5,
-        destinations_mode="inout",
+        destinations_mode="mixed",
+        city_to_city_probability=0.8,
     )
 
     plot_network_density(
@@ -1349,8 +1634,10 @@ if __name__ == "__main__":
         injection_rate=0.05,
         max_new_cars=2,
         boundary_probability=0.7,
-        boundary_sources="inout",
-        boundary_destinations="inout",
+        boundary_sources="in",
+        boundary_destinations="out",
+        boundary_to_boundary_probability=0.85,
+        city_to_city_probability=0.8,
         allow_u_turn=False,
         record_snapshots=True,
         output="figures",
