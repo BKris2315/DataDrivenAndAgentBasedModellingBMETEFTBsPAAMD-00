@@ -210,3 +210,7 @@ __marimo__/
 *tar*
 *copy*
 *tmp*
+project1/**/*.png
+project1/**/*.gif
+project1/**/*.jpg
+project1/**/*.jpeg

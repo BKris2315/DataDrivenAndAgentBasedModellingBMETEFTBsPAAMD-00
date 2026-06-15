@@ -173,6 +173,9 @@ class GraphRoadNetwork:
         self.blocked_junction_moves = 0
         self.accepted_junction_moves = 0
         self.internal_moves = 0
+        self.junction_blocked_counts = {n: 0 for n in self.nodes}
+        self.junction_accepted_counts = {n: 0 for n in self.nodes}
+        self.od_flow_counts = {}
 
         self.od_pairs = []
         self.od_by_origin = {}
@@ -601,6 +604,23 @@ class GraphRoadNetwork:
         destination = self.random_reachable_destination_from(origin)
         return origin, destination
 
+    def record_od_flow(self, origin, destination):
+        key = (origin, destination)
+        self.od_flow_counts[key] = self.od_flow_counts.get(key, 0) + 1
+
+    def record_junction_result(self, junction, accepted):
+        if junction is None:
+            return
+
+        if accepted:
+            self.junction_accepted_counts[junction] = (
+                self.junction_accepted_counts.get(junction, 0) + 1
+            )
+        else:
+            self.junction_blocked_counts[junction] = (
+                self.junction_blocked_counts.get(junction, 0) + 1
+            )
+
     def spawn_car(self, origin, destination, speed=0):
         if origin == destination:
             self.failed_spawns += 1
@@ -635,6 +655,7 @@ class GraphRoadNetwork:
 
         road[0] = car_id
         self.spawned_cars += 1
+        self.record_od_flow(origin, destination)
         return True
 
     def random_inject(
@@ -746,6 +767,7 @@ class GraphRoadNetwork:
 
                 road[cell_idx] = car_id
                 self.spawned_cars += 1
+                self.record_od_flow(u, destination)
 
     # --------------------------------------------------------
     # Edge and route helpers
@@ -852,16 +874,49 @@ class GraphRoadNetwork:
     # NaSch speed update and movement planning
     # --------------------------------------------------------
 
-    def edge_gap(self, edge_idx, cell_idx, vmax):
+    def edge_gap(self, edge_idx, cell_idx, vmax, car_id=None, allow_u_turn=False):
         road = self.roads[edge_idx]
         L = len(road)
         gap = 0
+        car = self.cars.get(car_id) if car_id is not None else None
+        arrival_node = self.edges[edge_idx][1]
+        next_edge = None
+        next_edge_known = False
 
         for d in range(1, vmax + 1):
             j = cell_idx + d
 
             if j >= L:
-                gap += 1
+                if car_id is None:
+                    gap += 1
+                    continue
+
+                if car is not None and arrival_node == car.destination:
+                    gap += 1
+                    continue
+
+                if not next_edge_known:
+                    next_edge = self.get_next_edge_for_car(
+                        car_id,
+                        edge_idx,
+                        allow_u_turn=allow_u_turn,
+                    )
+                    next_edge_known = True
+
+                if next_edge is None:
+                    break
+
+                next_cell = j - L
+                next_road = self.roads[next_edge]
+                if next_cell >= len(next_road):
+                    gap += 1
+                    continue
+
+                if next_road[next_cell] == NSEMPTY:
+                    gap += 1
+                else:
+                    break
+
                 continue
 
             if road[j] == NSEMPTY:
@@ -871,7 +926,7 @@ class GraphRoadNetwork:
 
         return gap
 
-    def update_speeds(self, vmax=5, p=0.3):
+    def update_speeds(self, vmax=5, p=0.3, allow_u_turn=False):
         for ei, road in enumerate(self.roads):
             for i, car_id in enumerate(road):
                 if car_id == NSEMPTY:
@@ -880,7 +935,13 @@ class GraphRoadNetwork:
                 car = self.cars[car_id]
 
                 speed = min(car.speed + 1, vmax)
-                gap = self.edge_gap(ei, i, vmax)
+                gap = self.edge_gap(
+                    ei,
+                    i,
+                    vmax,
+                    car_id=car_id,
+                    allow_u_turn=allow_u_turn,
+                )
                 speed = min(speed, gap)
 
                 if random.random() < p:
@@ -1114,29 +1175,44 @@ class GraphRoadNetwork:
                 continue
 
             if plan.turn_type == "exit":
+                self.record_junction_result(plan.junction, accepted=True)
                 del self.cars[plan.car_id]
                 self.finished_cars += 1
                 continue
 
-            target_road = new_roads[plan.to_edge]
-            target_cell = min(max(plan.to_cell, 0), len(target_road) - 1)
-
-            if target_road[target_cell] == NSEMPTY:
-                target_road[target_cell] = plan.car_id
-                car = self.cars[plan.car_id]
-                car.path_pos += 1
+            if self.place_junction_move(new_roads, plan):
                 self.accepted_junction_moves += 1
+                self.record_junction_result(plan.junction, accepted=True)
             else:
                 self.block_at_edge_end(new_roads, plan)
                 self.blocked_junction_moves += 1
+                self.record_junction_result(plan.junction, accepted=False)
 
         # Rejected junction movements stay at the end of their current edge.
         for plan in rejected_junction:
             if plan.car_id in self.cars:
                 self.block_at_edge_end(new_roads, plan)
                 self.blocked_junction_moves += 1
+                self.record_junction_result(plan.junction, accepted=False)
 
         self.roads = new_roads
+
+    def place_junction_move(self, new_roads, plan):
+        target_road = new_roads[plan.to_edge]
+        target_cell = min(max(plan.to_cell, 0), len(target_road) - 1)
+        from_road_len = len(new_roads[plan.from_edge])
+
+        for cell in range(target_cell, -1, -1):
+            if target_road[cell] != NSEMPTY:
+                continue
+
+            target_road[cell] = plan.car_id
+            car = self.cars[plan.car_id]
+            car.path_pos += 1
+            car.speed = max(0, from_road_len - plan.from_cell + cell)
+            return True
+
+        return False
 
     def place_or_block_internal(self, new_roads, plan):
         road = new_roads[plan.to_edge]
@@ -1191,7 +1267,7 @@ class GraphRoadNetwork:
         record_snapshot=False,
         t=None,
     ):
-        self.update_speeds(vmax=vmax, p=p)
+        self.update_speeds(vmax=vmax, p=p, allow_u_turn=allow_u_turn)
         internal_plans, junction_plans = self.plan_movements(allow_u_turn=allow_u_turn)
         accepted, rejected = self.resolve_junctions(junction_plans)
         self.apply_plans(internal_plans, accepted, rejected)
@@ -1256,6 +1332,8 @@ class GraphRoadNetwork:
             edge_speed_sum[i] / edge_counts[i] if edge_counts[i] else 0.0
             for i in range(len(self.roads))
         ]
+        total_cars = sum(edge_counts)
+        mean_speed = sum(edge_speed_sum) / total_cars if total_cars else 0.0
 
         self.snapshots.append(
             {
@@ -1264,9 +1342,15 @@ class GraphRoadNetwork:
                 "edge_counts": edge_counts,
                 "edge_density": edge_density,
                 "edge_mean_speed": edge_mean_speed,
-                "total_cars": sum(edge_counts),
+                "total_cars": total_cars,
                 "finished_cars": self.finished_cars,
                 "spawned_cars": self.spawned_cars,
+                "failed_spawns": self.failed_spawns,
+                "accepted_junction_moves": self.accepted_junction_moves,
+                "blocked_junction_moves": self.blocked_junction_moves,
+                "mean_speed": mean_speed,
+                "junction_accepted_counts": dict(self.junction_accepted_counts),
+                "junction_blocked_counts": dict(self.junction_blocked_counts),
             }
         )
 
@@ -1764,6 +1848,430 @@ def animate_moving_cars(
     anim.save(output, writer=PillowWriter(fps=fps))
     plt.close(fig)
     print(f"Saved {output}")
+
+
+def require_snapshots(network):
+    if not network.snapshots:
+        raise ValueError("No snapshots available. Run with record_snapshots=True first.")
+    return network.snapshots
+
+
+def snapshot_times(snapshots):
+    return [snapshot["t"] if snapshot.get("t") is not None else i for i, snapshot in enumerate(snapshots)]
+
+
+def snapshot_mean_speed(snapshot):
+    if "mean_speed" in snapshot:
+        return snapshot["mean_speed"]
+
+    edge_counts = snapshot.get("edge_counts", [])
+    edge_speeds = snapshot.get("edge_mean_speed", [])
+    total_cars = sum(edge_counts)
+    if not total_cars:
+        return 0.0
+
+    weighted_speed = sum(count * speed for count, speed in zip(edge_counts, edge_speeds))
+    return weighted_speed / total_cars
+
+
+def plot_traffic_timeseries(network, output="figures/analytics/traffic_timeseries.png"):
+    snapshots = require_snapshots(network)
+    t = snapshot_times(snapshots)
+
+    active = [snapshot["total_cars"] for snapshot in snapshots]
+    spawned = [snapshot["spawned_cars"] for snapshot in snapshots]
+    finished = [snapshot["finished_cars"] for snapshot in snapshots]
+    mean_speed = [snapshot_mean_speed(snapshot) for snapshot in snapshots]
+    failed_spawns = [snapshot.get("failed_spawns", np.nan) for snapshot in snapshots]
+    blocked = [snapshot.get("blocked_junction_moves", np.nan) for snapshot in snapshots]
+    accepted = [snapshot.get("accepted_junction_moves", np.nan) for snapshot in snapshots]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    ax = axes[0, 0]
+    ax.plot(t, active, label="active cars", color="#2563eb")
+    ax.plot(t, spawned, label="spawned cars", color="#16a34a")
+    ax.plot(t, finished, label="finished cars", color="#dc2626")
+    ax.set_ylabel("Cars")
+    ax.set_title("Traffic Throughput")
+    ax.legend()
+
+    ax = axes[0, 1]
+    ax.plot(t, mean_speed, color="#7c3aed")
+    ax.set_ylabel("Cells per step")
+    ax.set_title("Mean Speed")
+
+    ax = axes[1, 0]
+    ax.plot(t, failed_spawns, color="#ea580c")
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Failed spawns")
+    ax.set_title("Entry Pressure")
+
+    ax = axes[1, 1]
+    ax.plot(t, blocked, label="blocked junction moves", color="#be123c")
+    ax.plot(t, accepted, label="accepted junction moves", color="#0891b2")
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Cumulative moves")
+    ax.set_title("Junction Flow")
+    ax.legend()
+
+    for ax in axes.ravel():
+        ax.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    plt.savefig(output, dpi=200)
+    plt.close(fig)
+    print(f"Saved {output}")
+
+
+def plot_fundamental_diagram(
+    network,
+    output="figures/analytics/fundamental_diagram.png",
+    max_points=60000,
+):
+    snapshots = require_snapshots(network)
+    density = []
+    speed = []
+
+    for snapshot in snapshots:
+        density.extend(snapshot["edge_density"])
+        speed.extend(snapshot["edge_mean_speed"])
+
+    density = np.array(density, dtype=float)
+    speed = np.array(speed, dtype=float)
+
+    if len(density) > max_points:
+        idx = np.linspace(0, len(density) - 1, max_points, dtype=int)
+        density = density[idx]
+        speed = speed[idx]
+
+    flow = density * speed
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    sc = ax.scatter(
+        density,
+        speed,
+        c=flow,
+        s=5,
+        alpha=0.25,
+        cmap="viridis",
+        linewidth=0,
+    )
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("Estimated flow = density * speed")
+    ax.set_xlabel("Road density")
+    ax.set_ylabel("Mean speed")
+    ax.set_title("Density-Speed Fundamental Diagram")
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    plt.savefig(output, dpi=200)
+    plt.close(fig)
+    print(f"Saved {output}")
+
+
+def edge_bottleneck_statistics(network, congestion_threshold=0.6):
+    snapshots = require_snapshots(network)
+    density = np.array([snapshot["edge_density"] for snapshot in snapshots], dtype=float)
+    speed = np.array([snapshot["edge_mean_speed"] for snapshot in snapshots], dtype=float)
+
+    return {
+        "mean_density": density.mean(axis=0),
+        "max_density": density.max(axis=0),
+        "mean_speed": speed.mean(axis=0),
+        "time_congested": (density >= congestion_threshold).mean(axis=0),
+    }
+
+
+def plot_network_metric_map(G, network, values, label, output, title, cmap_name="magma_r"):
+    pos = {n: (float(d["x"]), float(d["y"])) for n, d in G.nodes(data=True)}
+    vmax_value = max(values) if len(values) else 1
+    if vmax_value == 0:
+        vmax_value = 1
+
+    norm = mpl.colors.Normalize(vmin=0, vmax=vmax_value)
+    cmap = plt.get_cmap(cmap_name)
+    edge_colors = [cmap(norm(value)) for value in values]
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        node_size=5,
+        node_color="black",
+        alpha=0.25,
+        ax=ax,
+    )
+    edge_collection = mpl.collections.LineCollection(
+        [[pos[u], pos[v]] for u, v in network.edges],
+        colors=edge_colors,
+        linewidths=1.9,
+        alpha=0.95,
+    )
+    ax.add_collection(edge_collection)
+    draw_boundary_nodes(ax, network, pos)
+
+    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax)
+    cbar.set_label(label)
+
+    ax.set_title(title)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.autoscale()
+    if network.in_nodes or network.out_nodes:
+        ax.legend(loc="upper right", frameon=True)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    plt.savefig(output, dpi=200)
+    plt.close(fig)
+    print(f"Saved {output}")
+
+
+def plot_bottleneck_map(
+    G,
+    network,
+    output="figures/analytics/bottleneck_map.png",
+    metric="time_congested",
+    congestion_threshold=0.6,
+):
+    stats = edge_bottleneck_statistics(network, congestion_threshold=congestion_threshold)
+    labels = {
+        "mean_density": "Mean density",
+        "max_density": "Maximum density",
+        "mean_speed": "Mean speed",
+        "time_congested": f"Share of time density >= {congestion_threshold}",
+    }
+    values = stats[metric]
+    plot_network_metric_map(
+        G,
+        network,
+        values,
+        labels.get(metric, metric),
+        output,
+        title="Bottleneck Map",
+    )
+
+
+def plot_bottleneck_ranking(
+    network,
+    output="figures/analytics/bottleneck_ranking.png",
+    top_n=15,
+    congestion_threshold=0.6,
+):
+    stats = edge_bottleneck_statistics(network, congestion_threshold=congestion_threshold)
+    score = stats["time_congested"]
+    top_indices = np.argsort(score)[::-1][:top_n]
+
+    labels = []
+    values = []
+    for edge_idx in top_indices:
+        u, v = network.edges[edge_idx]
+        labels.append(f"{edge_idx}: {u}->{v}")
+        values.append(score[edge_idx])
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.barh(range(len(values)), values, color="#be123c")
+    ax.set_yticks(range(len(values)))
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel(f"Share of snapshots with density >= {congestion_threshold}")
+    ax.set_title("Top Bottleneck Roads")
+    ax.grid(True, axis="x", alpha=0.25)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    plt.savefig(output, dpi=200)
+    plt.close(fig)
+    print(f"Saved {output}")
+
+
+def plot_junction_pressure_map(
+    G,
+    network,
+    output="figures/analytics/junction_pressure_map.png",
+    metric="blocked",
+):
+    pos = {n: (float(d["x"]), float(d["y"])) for n, d in G.nodes(data=True)}
+    blocked = np.array([network.junction_blocked_counts.get(n, 0) for n in G.nodes()], dtype=float)
+    accepted = np.array([network.junction_accepted_counts.get(n, 0) for n in G.nodes()], dtype=float)
+    total = blocked + accepted
+
+    if metric == "ratio":
+        values = np.divide(blocked, total, out=np.zeros_like(blocked), where=total > 0)
+        label = "Blocked / all junction requests"
+    elif metric == "accepted":
+        values = accepted
+        label = "Accepted junction moves"
+    else:
+        values = blocked
+        label = "Blocked junction moves"
+
+    sizes = 12 + 80 * np.divide(total, total.max(), out=np.zeros_like(total), where=total.max() > 0)
+    vmax_value = values.max() if len(values) else 1
+    if vmax_value == 0:
+        vmax_value = 1
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    nx.draw_networkx_edges(G, pos, edge_color="#b8b8b8", width=0.8, alpha=0.5, ax=ax)
+    sc = ax.scatter(
+        [pos[n][0] for n in G.nodes()],
+        [pos[n][1] for n in G.nodes()],
+        s=sizes,
+        c=values,
+        cmap="inferno",
+        vmin=0,
+        vmax=vmax_value,
+        alpha=0.9,
+        linewidth=0,
+    )
+    draw_boundary_nodes(ax, network, pos)
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label(label)
+    ax.set_title("Junction Pressure Map")
+    ax.set_aspect("equal")
+    ax.axis("off")
+    if network.in_nodes or network.out_nodes:
+        ax.legend(loc="upper right", frameon=True)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    plt.savefig(output, dpi=200)
+    plt.close(fig)
+    print(f"Saved {output}")
+
+
+def node_flow_group(network, node, axis):
+    if axis == "origin" and node in network.in_nodes:
+        return node
+    if axis == "destination" and node in network.out_nodes:
+        return node
+    return "internal"
+
+
+def plot_od_flow_matrix(network, output="figures/analytics/od_flow_matrix.png"):
+    row_labels = sorted(network.in_nodes) + ["internal"]
+    col_labels = sorted(network.out_nodes) + ["internal"]
+    matrix = np.zeros((len(row_labels), len(col_labels)), dtype=int)
+    row_index = {label: i for i, label in enumerate(row_labels)}
+    col_index = {label: i for i, label in enumerate(col_labels)}
+
+    for (origin, destination), count in network.od_flow_counts.items():
+        row = node_flow_group(network, origin, axis="origin")
+        col = node_flow_group(network, destination, axis="destination")
+        matrix[row_index[row], col_index[col]] += count
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    im = ax.imshow(matrix, cmap="Blues")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Spawned trips")
+
+    ax.set_xticks(range(len(col_labels)))
+    ax.set_xticklabels(col_labels, rotation=35, ha="right")
+    ax.set_yticks(range(len(row_labels)))
+    ax.set_yticklabels(row_labels)
+    ax.set_xlabel("Destination")
+    ax.set_ylabel("Origin")
+    ax.set_title("Origin-Destination Flow Matrix")
+
+    if matrix.size <= 100:
+        for i in range(matrix.shape[0]):
+            for j in range(matrix.shape[1]):
+                ax.text(j, i, str(matrix[i, j]), ha="center", va="center", color="black", fontsize=8)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    plt.savefig(output, dpi=200)
+    plt.close(fig)
+    print(f"Saved {output}")
+
+
+def load_summary_record(summary):
+    if isinstance(summary, dict):
+        return summary
+
+    with open(summary) as f:
+        return json.load(f)
+
+
+def plot_scenario_comparison(
+    summaries,
+    output="figures/analytics/scenario_comparison.png",
+    labels=None,
+):
+    records = [load_summary_record(summary) for summary in summaries]
+    if labels is None:
+        labels = [f"scenario {i + 1}" for i in range(len(records))]
+
+    metrics = [
+        ("cars_on_network", "Cars left"),
+        ("finished_cars", "Finished trips"),
+        ("failed_spawns", "Failed spawns"),
+        ("mean_speed", "Mean speed"),
+        ("blocked_junction_moves", "Blocked junction moves"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    axes = axes.ravel()
+
+    for ax, (key, title) in zip(axes, metrics):
+        values = [record.get(key, 0) for record in records]
+        ax.bar(labels, values, color="#2563eb")
+        ax.set_title(title)
+        ax.tick_params(axis="x", rotation=25)
+        ax.grid(True, axis="y", alpha=0.25)
+
+    axes[-1].axis("off")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    plt.savefig(output, dpi=200)
+    plt.close(fig)
+    print(f"Saved {output}")
+
+
+def plot_additional_result_figures(
+    G,
+    network,
+    output_dir="figures/analytics",
+    scenario_summaries=None,
+    scenario_labels=None,
+    congestion_threshold=0.6,
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    outputs = {
+        "traffic_timeseries": os.path.join(output_dir, "traffic_timeseries.png"),
+        "fundamental_diagram": os.path.join(output_dir, "fundamental_diagram.png"),
+        "bottleneck_map": os.path.join(output_dir, "bottleneck_map.png"),
+        "bottleneck_ranking": os.path.join(output_dir, "bottleneck_ranking.png"),
+        "junction_pressure_map": os.path.join(output_dir, "junction_pressure_map.png"),
+        "od_flow_matrix": os.path.join(output_dir, "od_flow_matrix.png"),
+    }
+
+    plot_traffic_timeseries(network, output=outputs["traffic_timeseries"])
+    plot_fundamental_diagram(network, output=outputs["fundamental_diagram"])
+    plot_bottleneck_map(
+        G,
+        network,
+        output=outputs["bottleneck_map"],
+        congestion_threshold=congestion_threshold,
+    )
+    plot_bottleneck_ranking(
+        network,
+        output=outputs["bottleneck_ranking"],
+        congestion_threshold=congestion_threshold,
+    )
+    plot_junction_pressure_map(G, network, output=outputs["junction_pressure_map"])
+    plot_od_flow_matrix(network, output=outputs["od_flow_matrix"])
+
+    if scenario_summaries:
+        outputs["scenario_comparison"] = os.path.join(output_dir, "scenario_comparison.png")
+        plot_scenario_comparison(
+            scenario_summaries,
+            output=outputs["scenario_comparison"],
+            labels=scenario_labels,
+        )
+
+    return outputs
 
 
 def save_snapshots_json(network, output="figures/snapshots.json"):

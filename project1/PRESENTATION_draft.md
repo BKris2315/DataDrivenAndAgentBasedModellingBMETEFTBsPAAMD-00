@@ -423,26 +423,205 @@ city.
 
 ---
 
-## Implemented Analytical Figures
+## Additional Figures
 
-The notebook now generates an analytics folder for each run:
+The current project already has network, density, speed, and space-time plots.
 
-```text
-SAVE_DIR/figures/analytics/
+1. cumulative throughput over time,
+2. active cars over time,
+3. mean speed over time,
+4. failed spawns over time,
+5. blocked junction moves over time,
+6. density-speed scatter plot,
+7. edge bottleneck ranking,
+8. scenario comparison bar charts.
+
+
+---
+
+## Figure Idea: Throughput Curves
+
+Plot time series from `snapshots.json`:
+
+- active cars,
+- spawned cars,
+- finished cars,
+- mean speed.
+
+This answers:
+
+- Is the system stabilizing?
+- Is congestion accumulating?
+- Does throughput saturate?
+- When does the network start to break down?
+
+This should be one of the first extra result figures.
+
+---
+
+## Fundamental Diagram
+
+Create a scatter plot with points for edge-time observations:
+
+- x-axis: edge density,
+- y-axis: mean speed or estimated flow.
+
+Expected pattern:
+
+- low density: high speed,
+- medium density: highest flow,
+- high density: speed collapse.
+
+This connects the simulation back to classical traffic-flow theory.
+
+---
+
+## Bottleneck Map
+
+Aggregate each edge over all snapshots:
+
+- mean density,
+- maximum density,
+- mean speed,
+- time spent above a congestion threshold.
+
+Then color the network by these aggregate values.
+
+This produces a strong "where did congestion happen?" figure.
+
+It is often more presentation-friendly than showing only the final time step.
+
+---
+
+## Junction Pressure
+
+Track where junction moves are rejected.
+
+A useful map could color nodes by:
+
+- number of blocked incoming moves,
+- number of accepted crossing moves,
+- blocked-to-accepted ratio.
+
+This would show whether congestion is caused mainly by:
+
+- road capacity,
+- entry pressure,
+- or junction conflicts.
+
+This requires adding per-junction counters to the simulator.
+
+---
+
+## OD Flow Matrix
+
+Build a matrix or heatmap:
+
+- rows: origin category or entry node,
+- columns: destination category or exit node,
+- values: number of spawned trips.
+
+This would make demand assumptions visible.
+
+For a presentation, this is helpful because it explains where cars are trying to
+go before showing where congestion appears.
+
+---
+
+## Animation Idea: Animated Density Map
+
+Use the saved snapshots to animate network density over time.
+
+For each frame:
+
+- compute density per edge,
+- draw the road graph,
+- color edges by density,
+- save frames as GIF or MP4.
+
+This is probably the clearest animation for a presentation because it keeps the
+map stable and shows congestion spreading or clearing.
+
+---
+
+## Implemented Animations
+
+The project now includes two snapshot-based GIF generators.
+
+```python
+animate_network_density(G, network, output="traffic_density.gif")
+animate_moving_cars(G, network, output="moving_cars.gif")
 ```
 
-It contains:
+Use `traffic_density.gif` for high-density or long runs because it stays readable
+even when thousands of cars are present.
 
-- `traffic_timeseries.png`: active cars, throughput, speed, failed spawns, and junction moves.
-- `fundamental_diagram.png`: edge density against mean speed, colored by estimated flow.
-- `bottleneck_map.png`: roads colored by time spent congested.
-- `bottleneck_ranking.png`: top bottleneck roads as a bar chart.
-- `junction_pressure_map.png`: nodes colored by blocked junction moves.
-- `od_flow_matrix.png`: origin-destination demand structure.
-- `scenario_comparison.png`: summary metric bars for one or more runs.
+Use `moving_cars.gif` for short demonstrations because individual vehicle motion
+is easier for the audience to understand.
 
-These figures turn the simulation from a visual demo into a quantitative result
-section.
+---
+
+## Animation Idea: Moving Cars on the Map
+
+Animate individual cars as points moving along road segments.
+
+For each car:
+
+- use current edge,
+- use cell index as progress along the edge,
+- interpolate between the edge's two node coordinates,
+- color by speed or destination type.
+
+This looks intuitive and lively, but it can get visually crowded with many cars.
+It is best for short clips or lower-density scenarios.
+
+---
+
+## Animation Idea: Queue Growth at Entries
+
+Show entry nodes and nearby roads over time.
+
+Possible visual encodings:
+
+- entry node size = failed spawn attempts,
+- incoming edge color = queue density,
+- label = cumulative inserted cars.
+
+This would be useful if you discuss network capacity or demand pressure.
+
+---
+
+## Animation Idea: Scenario Comparison
+
+Make a side-by-side animation:
+
+- left: shortest-path only,
+- right: congestion-aware rerouting.
+
+Use the same random seed and demand parameters.
+
+This is one of the best ways to communicate the value of the adaptive route
+choice algorithm.
+
+The audience can immediately see whether traffic spreads out or jams.
+
+---
+
+## Data to Log for Better Results
+
+The current snapshots are enough for many figures.
+
+For even stronger analysis, add logs for:
+
+- car birth time,
+- car finish time,
+- route length,
+- number of reroutes,
+- final trip duration,
+- rejected junction node,
+- selected route score at spawn time.
+
+These would enable travel-time distributions and route-choice analysis.
 
 ---
 
@@ -496,8 +675,8 @@ The interesting behavior comes from combining:
 - junction conflicts,
 - and adaptive route choice.
 
-The result section is strengthened by combining time series, bottleneck maps,
-OD flow summaries, and animations of congestion evolution.
+The next step is to strengthen the result section with time series, bottleneck
+maps, and animations of congestion evolution.
 
 ---
 

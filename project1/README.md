@@ -66,5 +66,16 @@ snapshots:
 For high-density runs, the density animation is usually clearer. For short
 low-density demonstrations, the moving-dot animation is more intuitive.
 
+The main simulation cell also writes additional analytical figures into
+`SAVE_DIR/figures/analytics/`:
+
+- `traffic_timeseries.png`
+- `fundamental_diagram.png`
+- `bottleneck_map.png`
+- `bottleneck_ranking.png`
+- `junction_pressure_map.png`
+- `od_flow_matrix.png`
+- `scenario_comparison.png`
+
 For a ready-to-use project explanation and slide-style outline, see
 `PRESENTATION.md`.
