@@ -1,0 +1,2 @@
+raw_rows,rows_after_missing,rows_after_calibrator_filter,rows_after_redshift_cut,z_min,z_max,mu_min,mu_max
+1701,1701,1624,705,0.01016,0.1494,32.7794,39.5154

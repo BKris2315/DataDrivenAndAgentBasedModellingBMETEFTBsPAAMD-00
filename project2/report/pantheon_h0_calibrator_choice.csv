@@ -1,0 +1,5 @@
+method,distance_col,distance_definition,H0,intercept,rmse,n,method_key,calibrator_choice,n_clean
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.88008629421223,0.0,1105.2409978121127,705,origin,calibrators excluded,705
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.57359167127738,0.0,1116.7056659988953,705,weighted_origin,calibrators excluded,705
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.87741740012758,0.0,1098.4208477872508,715,origin,calibrators included,715
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.57265979693986,0.0,1109.8608944854602,715,weighted_origin,calibrators included,715

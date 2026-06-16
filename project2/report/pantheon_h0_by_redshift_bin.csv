@@ -1,0 +1,11 @@
+method,distance_col,distance_definition,H0,intercept,rmse,n,method_key,bin,z_min,z_max,sample
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.26588267203962,0.0,517.878507209786,347,origin,"(0.009000000000000001, 0.03]",0.01016,0.02996,"(0.009000000000000001, 0.03]"
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.266981186591,0.0,517.8785161436965,347,weighted_origin,"(0.009000000000000001, 0.03]",0.01016,0.02996,"(0.009000000000000001, 0.03]"
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),72.69089693653308,0.0,736.2443414638683,177,origin,"(0.03, 0.05]",0.03012,0.04989,"(0.03, 0.05]"
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.27547663562065,0.0,741.8467062492043,177,weighted_origin,"(0.03, 0.05]",0.03012,0.04989,"(0.03, 0.05]"
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.6554702428428,0.0,1386.842063107393,82,origin,"(0.05, 0.08]",0.05018,0.07991,"(0.05, 0.08]"
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.89877662070641,0.0,1388.308379999313,82,weighted_origin,"(0.05, 0.08]",0.05018,0.07991,"(0.05, 0.08]"
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),72.95976345538247,0.0,1454.7817028596187,14,origin,"(0.08, 0.1]",0.08009,0.0995,"(0.08, 0.1]"
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.4814850223969,0.0,1466.7616386557595,14,weighted_origin,"(0.08, 0.1]",0.08009,0.0995,"(0.08, 0.1]"
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.30081938009103,0.0,2356.231642674741,85,origin,"(0.1, 0.15]",0.10165,0.1494,"(0.1, 0.15]"
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),75.1168916895203,0.0,2394.09134453692,85,weighted_origin,"(0.1, 0.15]",0.10165,0.1494,"(0.1, 0.15]"

@@ -1,0 +1,21 @@
+method,distance_col,distance_definition,H0,intercept,rmse,n,method_key,z_min_cut,z_max_cut,sample
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.88008629421223,0.0,1105.2409978121127,705,origin,0.005,0.15,0.005 <= z <= 0.15
+"ordinary least squares, free intercept",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.9443584052864,-18.94839960599529,1105.1775504436748,705,free_intercept,0.005,0.15,0.005 <= z <= 0.15
+Huber robust regression,hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.75053441533122,-118.90212508969476,1112.1501521824835,705,huber,0.005,0.15,0.005 <= z <= 0.15
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.57359167127738,0.0,1116.7056659988953,705,weighted_origin,0.005,0.15,0.005 <= z <= 0.15
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.88008629421223,0.0,1105.2409978121127,705,origin,0.01,0.15,0.01 <= z <= 0.15
+"ordinary least squares, free intercept",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.9443584052864,-18.94839960599529,1105.1775504436748,705,free_intercept,0.01,0.15,0.01 <= z <= 0.15
+Huber robust regression,hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.75053441533122,-118.90212508969476,1112.1501521824835,705,huber,0.01,0.15,0.01 <= z <= 0.15
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.57359167127738,0.0,1116.7056659988953,705,weighted_origin,0.01,0.15,0.01 <= z <= 0.15
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.89748733640009,0.0,1151.5208828655432,643,origin,0.015,0.15,0.015 <= z <= 0.15
+"ordinary least squares, free intercept",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.85726445699603,12.12491447609682,1151.4976342092455,643,free_intercept,0.015,0.15,0.015 <= z <= 0.15
+Huber robust regression,hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.69075871064581,-97.51115308312468,1158.911296805196,643,huber,0.015,0.15,0.015 <= z <= 0.15
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.5809201093992,0.0,1163.179032955224,643,weighted_origin,0.015,0.15,0.015 <= z <= 0.15
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.91511603771264,0.0,1220.472506239064,561,origin,0.02,0.15,0.02 <= z <= 0.15
+"ordinary least squares, free intercept",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.804522818655,34.582984266216954,1220.3106830499426,561,free_intercept,0.02,0.15,0.02 <= z <= 0.15
+Huber robust regression,hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.71360422113943,-96.52778938500693,1229.04302441537,561,huber,0.02,0.15,0.02 <= z <= 0.15
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.59692801541385,0.0,1232.881842318663,561,weighted_origin,0.02,0.15,0.02 <= z <= 0.15
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.92721114388641,0.0,1463.7639848565761,358,origin,0.03,0.15,0.03 <= z <= 0.15
+"ordinary least squares, free intercept",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.91938102817365,2.7925578389949806,1463.7633498123128,358,free_intercept,0.03,0.15,0.03 <= z <= 0.15
+Huber robust regression,hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),75.1799896874458,-242.68998341646108,1479.4245017630278,358,huber,0.03,0.15,0.03 <= z <= 0.15
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.64274056705095,0.0,1480.6085164300855,358,weighted_origin,0.03,0.15,0.03 <= z <= 0.15

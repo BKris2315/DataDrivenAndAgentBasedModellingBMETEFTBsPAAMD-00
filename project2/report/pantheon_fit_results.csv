@@ -1,0 +1,11 @@
+method,distance_col,distance_definition,H0,intercept,rmse,n,method_key
+"ordinary least squares, forced through origin",distance_mpc,luminosity distance D_L,67.01542074003974,0.0,1217.136262417068,705,origin
+"ordinary least squares, free intercept",distance_mpc,luminosity distance D_L,64.52546583744808,830.9917892155445,1090.6953785049848,705,free_intercept
+Huber robust regression,distance_mpc,luminosity distance D_L,65.64675481532572,634.3452140859104,1106.4194966241823,705,huber
+"weighted least squares, forced through origin",distance_mpc,luminosity distance D_L,67.45384694531639,0.0,1222.20419452375,705,weighted_origin
+"weighted least squares, free intercept",distance_mpc,luminosity distance D_L,65.12955498228669,833.777822824936,1101.6999562889594,705,weighted_free_intercept
+"ordinary least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.88008629421223,0.0,1105.2409978121127,705,origin
+"ordinary least squares, free intercept",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),73.9443584052864,-18.94839960599529,1105.1775504436748,705,free_intercept
+Huber robust regression,hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.75053441533122,-118.90212508969476,1112.1501521824835,705,huber
+"weighted least squares, forced through origin",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),74.57359167127738,0.0,1116.7056659988953,705,weighted_origin
+"weighted least squares, free intercept",hubble_distance_mpc,local Hubble-distance proxy D_L/(1+z),75.03753025638723,-146.98046991101884,1118.3983790394775,705,weighted_free_intercept
