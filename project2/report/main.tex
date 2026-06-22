@@ -1,0 +1,357 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{siunitx}
+\usepackage{listings}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!5},
+    columns=fullflexible
+}
+
+\title{Measuring Cosmic Expansion and Redshift from Official Astronomical Data\\
+\large Methods, Models, Expected Results, and Project Summary}
+\author{Benedek Kristof}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This project investigates how the expansion of the Universe can be measured from real astronomical data. The main analysis uses official Pantheon+SH0ES Type Ia supernova data to construct a low-redshift Hubble diagram and estimate the local expansion slope. A second analysis investigates how the result depends on preprocessing choices, redshift cuts, outlier rejection, and fitting method. The project then connects the catalogue-level Hubble analysis to the physical origin of redshift by measuring a spectroscopic redshift from an SDSS optical spectrum. Finally, the project compares physical/spectroscopic redshift measurement with photometric redshift prediction from SDSS broadband magnitudes using classical regression and machine-learning models.
+\end{abstract}
+
+\section{Project Motivation}
+
+The expansion of the Universe is one of the most important empirical discoveries in modern astronomy. At sufficiently low redshift, galaxies and supernova host galaxies approximately follow Hubble's law,
+\begin{equation}
+    v \approx H_0 D,
+\end{equation}
+where $v$ is the recession velocity, $D$ is distance, and $H_0$ is the Hubble constant. In observational astronomy, the velocity is inferred from redshift, while the distance must be inferred from a distance indicator. This makes the problem well suited for a computational physics or data-analysis project: the project contains data acquisition, preprocessing, model fitting, visualization, uncertainty discussion, and interpretation of real measurements.
+
+The project is designed around four connected questions:
+\begin{enumerate}[label=\textbf{Q\arabic*.}]
+    \item Can a Hubble diagram be reconstructed from official Type Ia supernova data?
+    \item How sensitive is the estimated expansion slope to redshift cuts, outliers, and fitting method?
+    \item Can redshift be measured directly from a real SDSS spectrum by identifying shifted spectral lines?
+    \item How well can redshift be predicted from photometric colours using classical and machine-learning models?
+\end{enumerate}
+
+\section{Official Data Sources}
+
+\subsection{Pantheon+SH0ES Type Ia Supernova Data}
+
+The main Hubble-law analysis uses the Pantheon+SH0ES data release. Pantheon+ is a large compilation of Type Ia supernova light curves and distances used for modern cosmological analyses. The Pantheon+ release contains 1701 light curves of 1550 spectroscopically confirmed Type Ia supernovae, compiled across multiple surveys. The project uses the public file \texttt{Pantheon+SH0ES.dat}, which contains supernova redshifts, corrected distance moduli, uncertainties, and calibration-related flags.
+
+Type Ia supernovae are useful for this project because they act as standardizable candles. Their measured apparent brightness can be converted into a distance modulus after light-curve corrections. This provides a distance estimate independent of simply converting redshift into distance, making the Hubble diagram physically meaningful.
+
+\subsection{SDSS Spectroscopic Data}
+
+The spectroscopic-redshift part uses a spectrum from the Sloan Digital Sky Survey (SDSS). SDSS spectra are provided as FITS files containing calibrated flux as a function of wavelength, along with metadata such as the catalogue redshift and object class. In the current project, the example object is the SDSS source linked through SkyServer with \texttt{SpecObjID = 599115398197045248}. SkyServer identifies this object as a quasar-like object with catalogue redshift approximately $z \approx 0.309$.
+
+The goal of this section is not to use the catalogue redshift directly, but to reproduce the idea of redshift measurement from the spectrum itself. Known rest-frame emission lines are matched to observed peaks. The wavelength shift gives
+\begin{equation}
+    z = \frac{\lambda_{\mathrm{obs}} - \lambda_{\mathrm{rest}}}{\lambda_{\mathrm{rest}}}
+      = \frac{\lambda_{\mathrm{obs}}}{\lambda_{\mathrm{rest}}} - 1.
+\end{equation}
+
+\subsection{SDSS Photometric Data}
+
+The photometric-redshift extension uses SDSS galaxy photometry. The features are broadband magnitudes in the SDSS filters $u$, $g$, $r$, $i$, and $z$, together with colour indices such as $u-g$, $g-r$, $r-i$, and $i-z$. The target variable is the spectroscopic redshift, which is used as the supervised-learning label.
+
+This part is conceptually different from the spectroscopic-redshift notebook. Spectroscopy measures redshift from shifted spectral lines and is usually more accurate. Photometric redshift, often written photo-$z$, estimates redshift from a small number of broadband brightness measurements. It is faster and available for many more objects, but it is less precise and more prone to degeneracies.
+
+\section{Data Preprocessing}
+
+\subsection{Pantheon+ Preprocessing}
+
+The preprocessing stage is scientifically important because the Hubble-law fit is sensitive to bad measurements, local peculiar velocities, and inconsistent calibration choices. The intended pipeline is:
+
+\begin{enumerate}
+    \item \textbf{Load the official table.} The raw \texttt{Pantheon+SH0ES.dat} file is read into a dataframe.
+    \item \textbf{Standardize missing values.} Placeholder values such as \texttt{-9}, \texttt{-99}, or \texttt{-999} are converted to missing values.
+    \item \textbf{Select relevant columns.} The analysis uses a supernova identifier, redshift, distance modulus, distance-modulus uncertainty, and calibration flags where available.
+    \item \textbf{Choose a redshift frame.} The preferred redshift column is usually the cosmology-corrected or CMB-frame redshift if available, because it better represents motion with respect to the large-scale expansion.
+    \item \textbf{Apply quality filters.} Rows with missing redshift or distance modulus are removed. Objects with unphysical redshift or distance modulus values are discarded.
+    \item \textbf{Apply a low-redshift selection.} The basic linear Hubble-law approximation is most appropriate at low redshift. A default range such as $0.01 < z < 0.15$ is used.
+    \item \textbf{Convert distance modulus to luminosity distance.} The conversion is
+    \begin{equation}
+        D_L(\mathrm{Mpc}) = 10^{(\mu - 25)/5},
+    \end{equation}
+    where $\mu$ is the distance modulus.
+    \item \textbf{Convert redshift to approximate recession velocity.} At low redshift,
+    \begin{equation}
+        v \approx cz,
+    \end{equation}
+    where $c = \SI{299792.458}{km.s^{-1}}$.
+\end{enumerate}
+
+The lower redshift cut is important. At extremely low redshift, peculiar velocities caused by local gravitational motion can be a large fraction of the observed recession velocity. This can strongly bias a simple estimate of $H_0$. The upper redshift cut is also important because the simple linear law $v = H_0 D$ becomes less accurate at larger redshift, where the full cosmological luminosity-distance relation should be used.
+
+\subsection{SDSS Spectrum Preprocessing}
+
+The SDSS spectrum analysis requires different preprocessing:
+
+\begin{enumerate}
+    \item Load the FITS spectrum.
+    \item Convert the logarithmic wavelength grid to wavelength in Angstroms.
+    \item Extract the calibrated flux array and optional inverse-variance uncertainties.
+    \item Mask bad pixels and non-finite values.
+    \item Estimate the continuum using smoothing or a robust rolling median.
+    \item Subtract the continuum so that emission features are easier to detect.
+    \item Detect candidate peaks in the continuum-subtracted spectrum.
+    \item Fit Gaussian profiles around selected emission lines to estimate line centres more accurately.
+\end{enumerate}
+
+Continuum subtraction is needed because astronomical spectra contain both broad continuum emission and narrower spectral features. Redshift is measured from the positions of lines, so the local continuum can obscure or bias peak detection if it is not removed.
+
+\subsection{SDSS Photometric-Redshift Preprocessing}
+
+For photometric redshift prediction, the preprocessing pipeline is:
+
+\begin{enumerate}
+    \item Query SDSS for galaxies with clean photometry and known spectroscopic redshift.
+    \item Keep the $u,g,r,i,z$ magnitudes and the spectroscopic redshift label.
+    \item Remove rows with invalid, missing, saturated, or extreme magnitude values.
+    \item Build colour features:
+    \begin{align}
+        u-g, \quad g-r, \quad r-i, \quad i-z.
+    \end{align}
+    \item Split data into training and test sets.
+    \item Standardize features for models sensitive to feature scale, such as ridge regression, k-nearest neighbours, and multilayer perceptrons.
+\end{enumerate}
+
+Colours are often more informative than raw magnitudes because they encode the shape of the spectral energy distribution. As redshift increases, spectral features move through the fixed photometric filters, changing the observed colours.
+
+\section{Physical and Statistical Methods}
+
+\subsection{Hubble-Law Estimation}
+
+The simplest model is a linear relation between recession velocity and distance:
+\begin{equation}
+    v_i = H_0 D_i + \epsilon_i.
+\end{equation}
+The slope of the best-fit line is interpreted as an estimate of the local expansion rate.
+
+Two linear-fitting variants are useful:
+\begin{enumerate}
+    \item \textbf{Fit with intercept:}
+    \begin{equation}
+        v_i = a + H_0 D_i + \epsilon_i.
+    \end{equation}
+    This can reveal systematic offsets, but the physical Hubble law passes through the origin.
+    \item \textbf{Fit through origin:}
+    \begin{equation}
+        v_i = H_0 D_i + \epsilon_i.
+    \end{equation}
+    This is physically motivated but may be more sensitive to calibration errors or local peculiar velocities.
+\end{enumerate}
+
+A weighted version can be used if distance or distance-modulus uncertainties are available. In this case, measurements with smaller uncertainty contribute more strongly to the fit.
+
+\subsection{Residual Analysis}
+
+After fitting, residuals are computed as
+\begin{equation}
+    r_i = v_i - \hat{v}_i.
+\end{equation}
+Residual plots are used to check whether errors are randomly scattered or whether there is structure. A residual trend with distance or redshift may indicate that the model is too simple, that the redshift range is too large, or that the data contain systematic effects.
+
+\subsection{Sample-Dependence Tests}
+
+The sample-dependence notebook repeats the Hubble-law fit under several selections:
+\begin{itemize}
+    \item different maximum redshifts, such as $z < 0.03$, $z < 0.05$, $z < 0.10$, and $z < 0.15$;
+    \item different lower redshift cuts to reduce peculiar-velocity contamination;
+    \item with and without outlier rejection;
+    \item different fitting methods.
+\end{itemize}
+
+The expected output is a table and plot of estimated $H_0$ versus redshift cut. This directly addresses the scientific question: the measured expansion slope is not only a property of the Universe, but also depends on the data selection and modelling assumptions.
+
+\subsection{Spectroscopic Redshift from SDSS}
+
+For the SDSS spectrum, known rest-frame lines are matched to observed features. For a source with true redshift $z \approx 0.309$, a line with rest wavelength $\lambda_{\mathrm{rest}}$ should appear near
+\begin{equation}
+    \lambda_{\mathrm{obs}} \approx (1+z)\lambda_{\mathrm{rest}}.
+\end{equation}
+Example expected observed wavelengths are:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Line & Rest wavelength $\lambda_{\mathrm{rest}}$ (\AA) & Expected at $z=0.309$ (\AA) \\
+\midrule
+Mg II & 2798 & 3663 \\
+{[O II]} & 3727 & 4879 \\
+H$\beta$ & 4861 & 6363 \\
+{[O III]} & 5007 & 6555 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For each identified line, an individual redshift estimate is calculated:
+\begin{equation}
+    z_j = \frac{\lambda_{\mathrm{obs},j}}{\lambda_{\mathrm{rest},j}} - 1.
+\end{equation}
+The final measured redshift can be taken as the mean or uncertainty-weighted mean of the line-level estimates. The result is compared with the SDSS catalogue redshift.
+
+\subsection{Photometric-Redshift Prediction Models}
+
+The photo-$z$ notebook compares several supervised regression models. The input vector is
+\begin{equation}
+    \mathbf{x} = (u,g,r,i,z,u-g,g-r,r-i,i-z),
+\end{equation}
+while the target is the spectroscopic redshift $z_{\mathrm{spec}}$.
+
+The models are:
+
+\begin{enumerate}
+    \item \textbf{Ridge regression.} A linear baseline model with $L_2$ regularization. It tests how much redshift information is linearly encoded in colours.
+    \item \textbf{k-nearest neighbours regression.} A non-parametric method that predicts redshift from nearby examples in colour--magnitude space.
+    \item \textbf{Decision tree regression.} A classical nonlinear model that partitions the feature space into simple rules.
+    \item \textbf{Random forest regression.} An ensemble of decision trees that reduces overfitting and usually improves robustness.
+    \item \textbf{Gradient boosting regression.} A sequential ensemble method that often performs well on tabular data.
+    \item \textbf{Multilayer perceptron regression.} A simple neural-network-style model used as a machine-learning comparison.
+\end{enumerate}
+
+These models are evaluated on a held-out test set, not on the training data. This is necessary because flexible models can memorize the training set without generalizing to new galaxies.
+
+\section{Evaluation Metrics}
+
+For the Hubble-law part, the main outputs are:
+\begin{itemize}
+    \item estimated $H_0$ in \si{km.s^{-1}.Mpc^{-1}};
+    \item residual scatter;
+    \item comparison of $H_0$ across redshift cuts;
+    \item plots of velocity--distance and distance modulus--redshift relations.
+\end{itemize}
+
+For photometric redshift prediction, useful metrics are:
+\begin{align}
+    \mathrm{MAE} &= \frac{1}{N}\sum_i |z_i - \hat{z}_i|, \\
+    \mathrm{RMSE} &= \sqrt{\frac{1}{N}\sum_i (z_i - \hat{z}_i)^2}, \\
+    \Delta z_i &= \frac{\hat{z}_i - z_i}{1 + z_i}.
+\end{align}
+The normalized residual $\Delta z$ is commonly used because a redshift error of 0.02 is more severe at low redshift than at high redshift. The notebook can also compute bias, NMAD scatter, and catastrophic outlier fraction.
+
+\section{Expected Results}
+
+\subsection{Pantheon+ Hubble Diagram}
+
+The expected Hubble diagram should show that low-redshift Type Ia supernovae approximately follow a linear relation between distance and recession velocity. The result should not be a perfectly thin line because the data include measurement uncertainties, peculiar velocities, calibration uncertainty, and intrinsic scatter in standardized supernova brightness.
+
+The estimated local expansion slope should be of the same order as the accepted Hubble constant, roughly tens of \si{km.s^{-1}.Mpc^{-1}}, usually near $70\,\si{km.s^{-1}.Mpc^{-1}}$ depending on calibration and sample choices. However, the report should be careful: Type Ia supernova distance moduli are connected to the absolute magnitude calibration. Without an external calibration or an assumed absolute magnitude scale, supernovae constrain relative distances more directly than an absolute $H_0$. Therefore, the project result should be described as an effective local expansion slope under the chosen Pantheon+SH0ES calibration and preprocessing choices.
+
+\subsection{Sample Dependence}
+
+The expected sample-dependence result is that very nearby samples give noisier and less stable $H_0$ estimates. This happens because peculiar velocities are a larger fraction of the total observed redshift at small distances. As the redshift cut is increased, the fit should become more stable, but at sufficiently high redshift the simple linear approximation becomes less appropriate.
+
+The expected conclusion is not simply ``we measured $H_0$'', but rather:
+
+\begin{quote}
+The Hubble expansion is visible in the data, but the numerical estimate of the expansion rate depends on redshift cuts, calibration, outlier handling, and fitting method. This demonstrates why modern measurements of $H_0$ require careful modelling of systematics.
+\end{quote}
+
+\subsection{SDSS Spectroscopic Redshift}
+
+The SDSS spectrum analysis should detect several emission features whose observed wavelengths are shifted by a common factor. If the identified lines are correct, the measured redshift should be close to the SDSS catalogue value of approximately $z \approx 0.309$. Individual lines will not give exactly identical redshifts because of noise, blending, continuum subtraction, finite spectral resolution, and imperfect Gaussian fitting.
+
+The expected conclusion is:
+
+\begin{quote}
+The same redshift value can be recovered from multiple shifted spectral lines, showing that redshift is not just a catalogue number but a measurable wavelength-scaling effect in the spectrum.
+\end{quote}
+
+\subsection{Photometric Redshift Prediction}
+
+The photo-$z$ models are expected to be less accurate than the spectroscopic method. Linear models should provide a useful baseline, but nonlinear models such as random forests and gradient boosting are expected to perform better because the mapping from colour space to redshift is nonlinear and degenerate. The neural-network model may or may not outperform tree-based models depending on the training-set size and tuning.
+
+Expected qualitative ranking:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Method & Expected behaviour \\
+\midrule
+Spectral-line redshift & Most physically direct and accurate for one spectrum \\
+Ridge regression & Simple baseline, limited by linearity \\
+k-nearest neighbours & Can work well locally, sensitive to scaling and sparse regions \\
+Decision tree & Interpretable but prone to overfitting \\
+Random forest & Usually strong and robust for tabular data \\
+Gradient boosting & Often among the best classical ML methods \\
+MLP neural network & Potentially strong, but needs tuning and enough data \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Limitations}
+
+The project has several important limitations that should be discussed explicitly:
+
+\begin{itemize}
+    \item The simple Hubble law $v=H_0D$ is only a low-redshift approximation.
+    \item Supernova-based $H_0$ estimation depends on absolute calibration of Type Ia supernova luminosities.
+    \item Peculiar velocities introduce significant scatter at very low redshift.
+    \item SDSS photometric redshifts are approximate because broadband filters compress the full spectrum into only a few measurements.
+    \item Machine-learning models can be biased if the spectroscopic training sample is not representative of the photometric population.
+    \item The SDSS spectrum example demonstrates redshift measurement for one object; a larger spectroscopic sample would be needed for statistical conclusions.
+\end{itemize}
+
+\section{Suggested Final Report Structure}
+
+The final written report can use the following structure:
+
+\begin{enumerate}
+    \item \textbf{Introduction:} Hubble expansion, redshift, and motivation.
+    \item \textbf{Data:} Pantheon+SH0ES, SDSS spectrum, SDSS photometric sample.
+    \item \textbf{Preprocessing:} cleaning choices, redshift cuts, distance conversion, feature engineering.
+    \item \textbf{Methods:} Hubble-law fitting, residual analysis, spectral-line redshift, photo-$z$ models.
+    \item \textbf{Results:} Hubble diagram, sample-dependence plot, spectrum line fits, photo-$z$ model comparison.
+    \item \textbf{Discussion:} why the results vary, what the models show, and what the limitations are.
+    \item \textbf{Conclusion:} the project demonstrates cosmic expansion, physical redshift measurement, and the difference between spectroscopic and photometric redshift inference.
+\end{enumerate}
+
+\section{Overall Expected Conclusion}
+
+The expected overall conclusion of the project is:
+
+\begin{quote}
+Official astronomical data can reproduce the basic observational evidence for cosmic expansion. Pantheon+ Type Ia supernovae form a low-redshift Hubble diagram from which an effective local expansion slope can be estimated. The value is sensitive to preprocessing and sample selection, especially at very low redshift where peculiar velocities matter. SDSS spectra show the physical origin of redshift through shifted emission lines, and SDSS photometry shows how redshift can be approximately predicted from colours using classical and machine-learning regression methods. Spectroscopic redshift is more direct and accurate, while photometric redshift is scalable but noisier and more model-dependent.
+\end{quote}
+
+\begin{thebibliography}{9}
+
+\bibitem{pantheon_release}
+Pantheon+SH0ES Collaboration, \textit{PantheonPlusSH0ES/DataRelease}. GitHub repository. Available at: \url{https://github.com/PantheonPlusSH0ES/DataRelease}
+
+\bibitem{scolnic2022}
+D. Scolnic et al., \textit{The Pantheon+ Analysis: The Full Dataset and Light-Curve Release}, arXiv:2112.03863, 2021. Available at: \url{https://arxiv.org/abs/2112.03863}
+
+\bibitem{sdss_dr15_access}
+Sloan Digital Sky Survey, \textit{Data Access for SDSS DR15}. Available at: \url{https://www.sdss4.org/dr15/data_access/}
+
+\bibitem{sdss_photoz}
+Sloan Digital Sky Survey, \textit{Photometric Redshifts}. Available at: \url{https://www.sdss4.org/dr17/algorithms/photo-z/}
+
+\bibitem{skyserver}
+Sloan Digital Sky Survey SkyServer DR15, \textit{Explore and FITS Spectrum Tools}. Available at: \url{https://skyserver.sdss.org/dr15/}
+
+\end{thebibliography}
+
+\end{document}
